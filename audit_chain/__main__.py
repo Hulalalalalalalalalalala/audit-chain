@@ -2,6 +2,7 @@
 
     python -m audit_chain --path <log> append <tenant> --payload <json-file>
     python -m audit_chain --path <log> verify <tenant>
+    python -m audit_chain --path <log> export <tenant> --start I --end J
     python -m audit_chain --path <log> recover
     python -m audit_chain --path <log> rotate
     python -m audit_chain --path <log> compact [--max-segments N]
@@ -50,6 +51,17 @@ def _build_parser() -> argparse.ArgumentParser:
     verify_parser = subparsers.add_parser("verify", help="verify a tenant chain")
     verify_parser.add_argument("tenant")
 
+    export_parser = subparsers.add_parser(
+        "export", help="export a range proof for one tenant"
+    )
+    export_parser.add_argument("tenant")
+    export_parser.add_argument(
+        "--start", required=True, type=int, help="first index, inclusive"
+    )
+    export_parser.add_argument(
+        "--end", required=True, type=int, help="last index, exclusive"
+    )
+
     subparsers.add_parser("recover", help="truncate a half-written tail record")
     subparsers.add_parser("rotate", help="seal the active segment and start a new one")
 
@@ -80,6 +92,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             result = chain.verify(args.tenant)
             sys.stdout.write(_compact(result) + "\n")
             return 0 if result["ok"] else 1
+
+        if args.command == "export":
+            proof_obj = chain.export_range(args.tenant, args.start, args.end)
+            sys.stdout.write(_compact(proof_obj) + "\n")
+            return 0
 
         if args.command == "recover":
             result = chain.recover()

@@ -13,17 +13,21 @@ Two on-disk layouts are supported:
 from __future__ import annotations
 
 import contextlib
-import fcntl
 import hashlib
+import itertools
 import json
 import os
+import re
+import sys
 import time
 from typing import Any, Iterator, Optional
 
 from . import record as rec
 
 _ENCODING = "utf-8"
-LOCK_NAME = ".lock"
+# The lock file is always ``<log-path> + LOCK_SUFFIX``, whether the log is
+# currently a single file or a segment-store directory at the same path.
+LOCK_SUFFIX = ".lock"
 MANIFEST_NAME = "manifest.json"
 CACHE_NAME = ".verify-cache"
 SEG_PREFIX = "seg-"
@@ -31,6 +35,9 @@ SEG_SUFFIX = ".jsonl"
 FIRST_SEQ = 1
 _CHUNK = 1 << 20
 _LOCK_POLL_SECONDS = 0.01
+_IS_WINDOWS = sys.platform == "win32" or os.name == "nt"
+# Unique atomic-write temp names: ".<target>.<pid>.<counter>.tmp".
+_TEMP_NAME_RE = re.compile(r"^\..+\.\d+\.\d+\.tmp$")
 
 
 def seg_name(seq: int) -> str:
@@ -46,15 +53,76 @@ def seg_seq(name: str) -> Optional[int]:
     return int(middle)
 
 
-def atomic_write_text(directory: str, name: str, text: str) -> None:
-    """Durably replace ``directory/name`` with ``text`` (fsync + rename)."""
-    tmp_name = f".{name}.tmp"
+def atomic_write_text(
+    directory: str,
+    name: str,
+    text: str,
+    *,
+    crash: Optional[str] = None,
+) -> None:
+    """Durably replace ``directory/name`` with ``text`` (fsync + rename).
+
+    A unique temp name per process call lets concurrent readers refresh the
+    cache on Windows without sharing one fixed temp path. ``crash`` optionally
+    labels the two kill windows (temp durable / after rename).
+    """
+    from ._fault import crash_point
+
+    tmp_name = f".{name}.{os.getpid()}.{next(_temp_counter)}.tmp"
     tmp_path = os.path.join(directory, tmp_name)
     with open(tmp_path, "w", encoding=_ENCODING, newline="") as handle:
         handle.write(text)
         handle.flush()
         os.fsync(handle.fileno())
+    if crash is not None:
+        crash_point(f"{crash}:tmp")
     os.replace(tmp_path, os.path.join(directory, name))
+    if crash is not None:
+        crash_point(f"{crash}:rename")
+    fsync_dir(directory)
+
+
+_temp_counter = itertools.count(1)
+
+
+def atomic_write_bytes(
+    directory: str,
+    name: str,
+    raw: bytes,
+    *,
+    crash: Optional[str] = None,
+) -> None:
+    """Durably place ``directory/name`` = ``raw`` via temp file + rename."""
+    from ._fault import crash_point
+
+    tmp_name = f".{name}.{os.getpid()}.{next(_temp_counter)}.tmp"
+    tmp_path = os.path.join(directory, tmp_name)
+    with open(tmp_path, "wb") as handle:
+        handle.write(raw)
+        handle.flush()
+        os.fsync(handle.fileno())
+    if crash is not None:
+        crash_point(f"{crash}:segment-tmp")
+    os.replace(tmp_path, os.path.join(directory, name))
+    if crash is not None:
+        crash_point(f"{crash}:segment-rename")
+    fsync_dir(directory)
+
+
+def remove_temp_files(directory: str) -> None:
+    """Remove crash-leftover atomic-write temp files.
+
+    Only our unique ``.<name>.<pid>.<counter>.tmp`` names match, so an
+    unrelated dotfile in the same directory is never touched.
+    """
+    try:
+        names = os.listdir(directory)
+    except FileNotFoundError:
+        return
+    for name in names:
+        if _TEMP_NAME_RE.match(name):
+            with contextlib.suppress(OSError):
+                os.remove(os.path.join(directory, name))
     fsync_dir(directory)
 
 
@@ -116,16 +184,20 @@ class Layout:
     def __init__(self, root: str, kind: str):
         self.root = root
         self.kind = kind  # "dir" or "file"
+        # One stable lock inode for the whole lifetime of the path. Keeping it
+        # beside the log -- the same string whether ``root`` is currently a
+        # file or a directory -- means the file -> directory migration never
+        # has to move the lock and can never leave a window in which readers
+        # and the migrating writer hold different lock files.
+        self.lock_path = root + LOCK_SUFFIX
         if kind == "dir":
             self.data_dir = root
-            self.lock_path = os.path.join(root, LOCK_NAME)
             self.manifest_path = os.path.join(root, MANIFEST_NAME)
             self.cache_dir = root
             self.cache_name = CACHE_NAME
         else:
             directory = os.path.dirname(root) or "."
             self.data_dir = directory
-            self.lock_path = os.path.join(directory, "." + os.path.basename(root) + ".lock")
             self.manifest_path = ""
             self.cache_dir = directory
             self.cache_name = "." + os.path.basename(root) + ".verify-cache"
@@ -155,12 +227,30 @@ def ensure_lockfile(lock_path: str) -> None:
 
 @contextlib.contextmanager
 def file_lock(lock_path: str, *, timeout: Optional[float], shared: bool) -> Iterator[None]:
-    """Serialize access to one log behind a process-shared flock.
+    """Serialize access to one log behind a process-shared advisory lock.
 
-    Readers take a shared lock and the writer an exclusive one. A timeout
-    that elapses raises ``TimeoutError`` (an ``OSError`` subclass); callers
-    treat it like any other system error.
+    Readers take a shared lock and the writer an exclusive one. The backend is
+    the platform's own byte-range locking: ``fcntl.flock`` on POSIX and the
+    Win32 ``LockFileEx``/``UnlockFileEx`` APIs (via ``ctypes``) on Windows, so
+    importing this module never depends on a single platform. A timeout that
+    elapses raises ``TimeoutError`` (an ``OSError`` subclass); callers treat it
+    like any other system error. Permission failures and path errors surface
+    as ``OSError``.
     """
+    if _IS_WINDOWS:
+        with _windows_lock(lock_path, timeout=timeout, shared=shared):
+            yield
+    else:
+        with _posix_lock(lock_path, timeout=timeout, shared=shared):
+            yield
+
+
+@contextlib.contextmanager
+def _posix_lock(
+    lock_path: str, *, timeout: Optional[float], shared: bool
+) -> Iterator[None]:
+    import fcntl
+
     ensure_lockfile(lock_path)
     fd = os.open(lock_path, os.O_RDWR)
     acquired = False
@@ -181,6 +271,89 @@ def file_lock(lock_path: str, *, timeout: Optional[float], shared: bool) -> Iter
         if acquired:
             with contextlib.suppress(OSError):
                 fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+@contextlib.contextmanager
+def _windows_lock(
+    lock_path: str, *, timeout: Optional[float], shared: bool
+) -> Iterator[None]:
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    ensure_lockfile(lock_path)
+    # os.open gives an inheritable-free C runtime fd; _get_osfhandle yields the
+    # OS handle LockFileEx needs.
+    fd = os.open(lock_path, os.O_RDWR)
+    handle = msvcrt.get_osfhandle(fd)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.LockFileEx.restype = wintypes.BOOL
+    kernel32.LockFileEx.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.OVERLAPPED),
+    ]
+    kernel32.UnlockFileEx.restype = wintypes.BOOL
+    kernel32.UnlockFileEx.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.OVERLAPPED),
+    ]
+    LOCKFILE_FAIL_IMMEDIATELY = 0x00000001
+    LOCKFILE_EXCLUSIVE_LOCK = 0x00000002
+    flags = LOCKFILE_FAIL_IMMEDIATELY
+    if not shared:
+        flags |= LOCKFILE_EXCLUSIVE_LOCK
+
+    # LockFileEx locks a byte range described by a 64-bit offset/length pair.
+    length_low = wintypes.DWORD(1)
+    length_high = wintypes.DWORD(0)
+
+    def try_lock(overlapped: wintypes.OVERLAPPED) -> bool:
+        return bool(
+            kernel32.LockFileEx(
+                wintypes.HANDLE(handle),
+                wintypes.DWORD(flags),
+                wintypes.DWORD(0),
+                length_low,
+                length_high,
+                ctypes.byref(overlapped),
+            )
+        )
+
+    deadline = None if timeout is None else time.monotonic() + timeout
+    acquired = False
+    overlapped = wintypes.OVERLAPPED()
+    try:
+        while True:
+            if try_lock(overlapped):
+                acquired = True
+                break
+            error = ctypes.get_last_error()
+            # ERROR_LOCK_VIOLATION is the contended-case status.
+            if error != 33:
+                raise OSError(error, f"audit log lock failed: {lock_path}")
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError(f"audit log lock busy: {lock_path}")
+            time.sleep(_LOCK_POLL_SECONDS)
+        yield
+    finally:
+        if acquired:
+            overlapped_unlock = wintypes.OVERLAPPED()
+            with contextlib.suppress(OSError):
+                kernel32.UnlockFileEx(
+                    wintypes.HANDLE(handle),
+                    wintypes.DWORD(0),
+                    length_low,
+                    length_high,
+                    ctypes.byref(overlapped_unlock),
+                )
         os.close(fd)
 
 
@@ -250,8 +423,10 @@ def _valid_part(part: Any) -> bool:
     )
 
 
-def save_manifest(layout: Layout, manifest: dict) -> None:
-    atomic_write_text(layout.data_dir, MANIFEST_NAME, rec.canonical_json(manifest))
+def save_manifest(layout: Layout, manifest: dict, *, crash: Optional[str] = None) -> None:
+    atomic_write_text(
+        layout.data_dir, MANIFEST_NAME, rec.canonical_json(manifest), crash=crash
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -259,18 +434,42 @@ def save_manifest(layout: Layout, manifest: dict) -> None:
 # ---------------------------------------------------------------------------
 
 
-def cache_tag_payload(version: int, segments: dict) -> bytes:
-    return rec.canonical_json({"version": version, "segments": segments}).encode(
-        _ENCODING
+def manifest_view(manifest: Optional[dict]) -> Optional[str]:
+    """Canonical snapshot of the topology the cache was built against.
+
+    Binds the authenticated cache to the exact manifest (active segment and
+    every preserved window), so a cache can never be replayed against a
+    rewritten manifest or manifest windows swapped behind it.
+    """
+    if manifest is None:
+        return None
+    return rec.canonical_json(
+        {"active": manifest["active"], "segments": manifest["segments"]}
     )
 
 
-def load_cache(layout: Layout) -> Optional[dict]:
-    """Load the verify cache or return None when absent.
+def cache_tag_payload(version: int, segments: dict, view: Optional[str] = None) -> bytes:
+    body: dict = {"version": version, "segments": segments}
+    if view is not None:
+        body["view"] = view
+    return rec.canonical_json(body).encode(_ENCODING)
+
+
+def load_cache(
+    layout: Layout, manifest: Optional[dict] = None
+) -> Optional[dict]:
+    """Load the verify cache or return None when absent or stale.
 
     A present cache whose authentication tag fails to verify is tampering:
     ValueError is raised rather than silently rebuilding, because reporting
-    a clean pass off a forged cache must be impossible.
+    a clean pass off a forged cache must be impossible. For a segment store
+    the tag also covers the manifest view the cache was built against. A
+    cache from an older committed topology (e.g. a process killed between
+    the manifest swap and the cache swap) merely fails to match the current
+    view: that is a stale cache, not an attack, so it is discarded and
+    rebuilt from bytes -- reopening always converges on the on-disk
+    topology. Tampering with the manifest windows themselves is caught
+    separately by re-hashing the segment bytes.
     """
     try:
         with open(layout.cache_path, "rb") as handle:
@@ -285,14 +484,25 @@ def load_cache(layout: Layout) -> Optional[dict]:
         raise ValueError("tampered audit cache")
     tag = cache.get("tag")
     segments = cache.get("segments")
+    view = cache.get("view")
     if not isinstance(tag, str) or not isinstance(segments, dict):
         raise ValueError("tampered audit cache")
-    expected = hashlib.sha256(cache_tag_payload(1, segments)).hexdigest()
+    expected_view = manifest_view(manifest)
+    if expected_view is None:
+        if view is not None:
+            # A dir-view cache presented for a file layout (or vice versa):
+            # never adopt, but the tag check below still guards the bytes.
+            return None
+    elif view != expected_view:
+        return None
+    expected = hashlib.sha256(
+        cache_tag_payload(1, segments, view)
+    ).hexdigest()
     if not constant_time_equal(tag, expected):
         raise ValueError("tampered audit cache")
     if not _valid_cache_segments(segments):
         raise ValueError("tampered audit cache")
-    return {"version": 1, "segments": segments, "tag": tag}
+    return {"version": 1, "segments": segments, "tag": tag, "view": view}
 
 
 def constant_time_equal(actual: str, expected: str) -> bool:
@@ -345,11 +555,23 @@ def _valid_cache_segments(segments: Any) -> bool:
     return True
 
 
-def save_cache(layout: Layout, segments: dict) -> None:
-    tag = hashlib.sha256(cache_tag_payload(1, segments)).hexdigest()
-    payload = {"version": 1, "segments": segments, "tag": tag}
+def save_cache(
+    layout: Layout,
+    segments: dict,
+    manifest: Optional[dict] = None,
+    *,
+    crash: Optional[str] = None,
+) -> None:
+    view = manifest_view(manifest)
+    tag = hashlib.sha256(cache_tag_payload(1, segments, view)).hexdigest()
+    payload: dict = {"version": 1, "segments": segments, "tag": tag}
+    if view is not None:
+        payload["view"] = view
     atomic_write_text(
-        layout.cache_dir, layout.cache_name, rec.canonical_json(payload)
+        layout.cache_dir,
+        layout.cache_name,
+        rec.canonical_json(payload),
+        crash=crash,
     )
 
 

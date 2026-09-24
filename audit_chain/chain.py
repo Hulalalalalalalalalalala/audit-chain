@@ -17,7 +17,13 @@ semantics:
   change), so a repeated verification of a ten-thousand-entry log only
   hashes newly appended bytes instead of the whole file;
 * ``recover`` is the explicit entry point that truncates a half-written
-  tail line left by a killed process.
+  tail line left by a killed process;
+* every call sees a single snapshot: the on-disk topology is resolved
+  inside the lock and crash leftovers are settled to exactly one of the
+  old/new topologies before any byte is read;
+* ``export_range`` produces an offline proof (in-range chained records plus
+  the cross-segment window chain) that an independent reader can check with
+  the public digest algorithm alone.
 """
 
 from __future__ import annotations
@@ -27,8 +33,10 @@ import hashlib
 import os
 from typing import Any, Optional
 
+from . import proof as pf
 from . import record as rec
 from . import storage as st
+from ._fault import crash_point
 
 _ENCODING = "utf-8"
 _FILE_UNIT = "$"
@@ -49,7 +57,7 @@ class Chain:
         self.lock_timeout = lock_timeout
 
     # ------------------------------------------------------------------
-    # Layout / locking
+    # Layout / locking / crash settlement
     # ------------------------------------------------------------------
 
     def _layout(self) -> st.Layout:
@@ -62,20 +70,75 @@ class Chain:
 
     @contextlib.contextmanager
     def _locked(self, *, exclusive: bool):
+        # The lock is one stable sibling file (path + ".lock") for the whole
+        # lifetime of the path, so a migrating writer and any reader always
+        # contend on the same lock even across the file -> directory rename.
         layout = self._layout()
         with st.file_lock(
             layout.lock_path, timeout=self.lock_timeout, shared=not exclusive
         ):
-            self._adopt_backup()
+            # Re-resolve *after* waiting: the topology visible when the lock
+            # was requested may already have been replaced by the time it is
+            # granted. Settle every crash leftover to a single topology
+            # before the caller observes anything.
+            self._settle(exclusive=exclusive)
+            layout = self._layout()
             if exclusive and layout.kind == "dir":
                 # Reap segment files orphaned by a compaction killed after
                 # its manifest commit but before its source-file removal.
                 manifest = st.load_manifest(layout)
                 if manifest is not None:
                     self._gc_segments(layout, manifest)
-                with contextlib.suppress(OSError):
-                    os.remove(self.path + ".pre-segment")
             yield layout
+
+    def _settle(self, *, exclusive: bool) -> None:
+        """Bring a crash-interrupted store to exactly one old/new topology.
+
+        Possible leftovers, each with one deterministic resolution:
+
+        * migration killed between the two renames -> legacy file adopted
+          back from its backup, stale staging directory removed (old
+          topology wins; the store was never published);
+        * atomic manifest/cache/segment writes killed mid-flight -> their
+          unique ``.*.tmp`` files removed (the replacement either happened
+          atomically or never did);
+        * staging directory left beside a finished/never-started migration
+          -> removed.
+
+        Adoption (an atomic rename guarded by an existence check) is safe
+        under a shared lock; debris *deletion* is exclusive-only so one
+        shared reader can never remove another reader's in-flight temp file.
+        Sealed-segment bytes themselves are never repaired here; a
+        half-written tail line keeps its bad-line semantics until the
+        explicit ``recover()``.
+        """
+        self._adopt_backup()
+        if not exclusive:
+            return
+        if os.path.isdir(self.path):
+            st.remove_temp_files(self.path)
+            # The store was published, so the new topology won: the legacy
+            # file renamed aside and the old file-layout sidecar cache are now
+            # stale leftovers to reap deterministically.
+            backup = self.path + ".pre-segment"
+            with contextlib.suppress(OSError):
+                os.remove(backup)
+            old_cache = os.path.join(
+                os.path.dirname(self.path) or ".",
+                "." + os.path.basename(self.path) + ".verify-cache",
+            )
+            with contextlib.suppress(OSError):
+                os.remove(old_cache)
+        parent = os.path.dirname(self.path) or "."
+        st.remove_temp_files(parent)
+        staging = self.path + ".segstage"
+        if os.path.isdir(staging) and os.path.exists(self.path):
+            # The store was published (or never moved): staging is debris.
+            for name in os.listdir(staging):
+                with contextlib.suppress(OSError):
+                    os.unlink(os.path.join(staging, name))
+            with contextlib.suppress(OSError):
+                os.rmdir(staging)
 
     def _adopt_backup(self) -> None:
         """Restore a log left behind by a migration killed mid-rename.
@@ -223,10 +286,24 @@ class Chain:
             prev = states.get(tenant, (0, "", -1))[1]
             record, line = rec.build_line(tenant, payload, prev)
             target = units[-1]["path"]
+            # Two visible crash windows: death between the line body and its
+            # terminator leaves the documented half-line; death after the
+            # flush but before fsync leaves the line in the OS cache. Either
+            # way reopening sees whole-prefix-or-half-line, never a mix.
             with open(target, "a", encoding=_ENCODING, newline="") as handle:
-                handle.write(line + "\n")
+                handle.write(line)
                 handle.flush()
+                # Kill window 1: the record body is in the OS page cache but
+                # its terminator is not, so reopening finds the documented
+                # physical half-line (a bad line until explicit recover()).
+                crash_point("append:write")
+                handle.write("\n")
+                handle.flush()
+                # Kill window 2: complete line flushed but not fsynced.
+                crash_point("append:flush")
                 os.fsync(handle.fileno())
+                # Kill window 3: complete line durable.
+                crash_point("append:fsync")
 
             # Warm the cache with the single record just written: suffix
             # only, never a rehash of the whole file.
@@ -298,12 +375,17 @@ class Chain:
         if os.path.exists(backup):
             os.remove(backup)
         os.mkdir(staging)
+
         try:
             if raw:
                 first = st.seg_name(st.FIRST_SEQ)
                 second = st.seg_name(st.FIRST_SEQ + 1)
-                self._write_bytes(staging, first, raw)
-                self._write_bytes(staging, second, b"")
+                self._write_bytes(
+                    staging, first, raw, crash="migrate:first-segment"
+                )
+                self._write_bytes(
+                    staging, second, b"", crash="migrate:second-segment"
+                )
                 manifest = {
                     "version": 1,
                     "active": second,
@@ -324,10 +406,13 @@ class Chain:
                 }
             else:
                 first = st.seg_name(st.FIRST_SEQ)
-                self._write_bytes(staging, first, b"")
+                self._write_bytes(staging, first, b"", crash="migrate:first-segment")
                 manifest = st.default_manifest(first)
             st.atomic_write_text(
-                staging, st.MANIFEST_NAME, rec.canonical_json(manifest)
+                staging,
+                st.MANIFEST_NAME,
+                rec.canonical_json(manifest),
+                crash="migrate:manifest",
             )
 
             # Keep the old data until the new store is in place: rename it
@@ -337,9 +422,11 @@ class Chain:
             if os.path.exists(path):
                 os.replace(path, backup)
                 st.fsync_dir(parent)
+                crash_point("migrate:rename-backup")
             try:
                 os.replace(staging, path)
                 st.fsync_dir(parent)
+                crash_point("migrate:publish")
                 committed = True
             finally:
                 if not committed:
@@ -349,6 +436,7 @@ class Chain:
             if os.path.exists(backup):
                 os.remove(backup)
                 st.fsync_dir(parent)
+                crash_point("migrate:cleanup")
         except BaseException:
             # Roll the staging directory back out; the original file lives on
             # as the backup until the new store is fully published.
@@ -360,11 +448,10 @@ class Chain:
                     os.rmdir(staging)
             raise
 
-        # The sidecar cache/lock described the former single file.
+        # The sidecar cache described the former single file; the stable
+        # sibling lock (path + ".lock") is unchanged by the migration.
         with contextlib.suppress(OSError):
             os.remove(layout.cache_path)
-        with contextlib.suppress(OSError):
-            os.remove(layout.lock_path)
 
     def _rotate_dir(self, layout: st.Layout) -> None:
         units = self._view(layout)
@@ -410,13 +497,15 @@ class Chain:
                 segment["parts"] = seal_parts
         next_seq = max(st.seg_seq(s["name"]) for s in manifest["segments"]) + 1
         new_active = st.seg_name(next_seq)
-        self._write_bytes(layout.root, new_active, b"")
+        # The new segment file is durably in place before the manifest names
+        # it; a kill here leaves one orphan tmp/file under the old topology.
+        self._write_bytes(layout.root, new_active, b"", crash="rotate:active")
         manifest["segments"].append(
             {"name": new_active, "sealed": False, "parts": []}
         )
         manifest["active"] = new_active
-        st.save_manifest(layout, manifest)
-        st.save_cache(layout, entries)
+        st.save_manifest(layout, manifest, crash="rotate:manifest")
+        st.save_cache(layout, entries, manifest, crash="rotate:cache")
 
     def compact(self, max_segments: int = _DEFAULT_MAX_SEGMENTS) -> dict:
         """Merge old sealed segments while keeping each one's material.
@@ -441,7 +530,7 @@ class Chain:
                     raise ValueError("corrupt audit chain")
 
             manifest = st.load_manifest(layout)
-            cache = st.load_cache(layout)
+            cache = st.load_cache(layout, manifest)
             cache_segments = {} if cache is None else dict(cache["segments"])
 
             if max_segments == 1 and len(manifest["segments"]) > 1:
@@ -454,11 +543,12 @@ class Chain:
             # Commit the new topology first; the now-unreferenced sources are
             # removed after the durable manifest swap and otherwise garbage
             # collected on the next open, so a crash never loses data.
-            st.save_manifest(layout, manifest)
-            st.save_cache(layout, cache_segments)
+            st.save_manifest(layout, manifest, crash="compact:manifest")
+            st.save_cache(layout, cache_segments, manifest, crash="compact:cache")
             for name in removed:
                 with contextlib.suppress(FileNotFoundError):
                     os.remove(layout.segment_path(name))
+                    crash_point("compact:delete")
             st.fsync_dir(layout.root)
             count = len(manifest["segments"])
         return {"segments": count}
@@ -480,7 +570,7 @@ class Chain:
         merged, parts, carried = self._compose(layout, sources, cache_segments)
         name = st.seg_name(max(st.seg_seq(s["name"]) for s in sources) + 1)
         target = layout.segment_path(name)
-        self._write_bytes(layout.root, name, merged)
+        self._write_bytes(layout.root, name, merged, crash="compact:segment")
         for source in sources:
             cache_segments.pop(source["name"], None)
         if carried is not None:
@@ -503,7 +593,7 @@ class Chain:
             max(st.seg_seq(s["name"]) for s in manifest["segments"]) + 1
         )
         target = layout.segment_path(name)
-        self._write_bytes(layout.root, name, merged)
+        self._write_bytes(layout.root, name, merged, crash="compact:segment")
         manifest["segments"] = [
             {"name": name, "sealed": True, "parts": parts}
         ] + manifest["segments"][2:]
@@ -584,7 +674,8 @@ class Chain:
           one tenant's corruption never changes another tenant's verdict
           while ``first_bad`` stays the global per-tenant index.
         """
-        cache = st.load_cache(layout)
+        manifest = st.load_manifest(layout) if layout.kind == "dir" else None
+        cache = st.load_cache(layout, manifest)
         cached = {} if cache is None else cache["segments"]
         states: dict[str, list] = {}
         entries: dict[str, dict] = {}
@@ -625,7 +716,7 @@ class Chain:
                 and stat.st_size > entry["size"]
             ):
                 # Appended-only growth on the active unit. Writers are
-                # flock-serialized and O_APPEND-only, and the writer warms
+                # lock-serialized and O_APPEND-only, and the writer warms
                 # this cache itself; an unwarmed growth (crashed writer,
                 # out-of-band append) is still safe because the suffix's
                 # predecessor links must match the cached heads. Only the
@@ -683,7 +774,7 @@ class Chain:
             if state is not None and state[2] == -1:
                 state[2] = index
 
-        st.save_cache(layout, entries)
+        st.save_cache(layout, entries, manifest)
         return (
             {tenant: (state[0], state[1], state[2]) for tenant, state in states.items()},
             entries,
@@ -799,15 +890,165 @@ class Chain:
             states[tenant] = [count + 1, record["digest"], bad]
 
     # ------------------------------------------------------------------
+    # Range export
+    # ------------------------------------------------------------------
+
+    def export_range(self, tenant: str, start: int, end: int) -> dict:
+        """Build an offline proof for ``tenant``'s indices ``[start, end)``.
+
+        The proof holds exactly the in-range chained records plus the
+        cross-segment window chain needed to link them; no out-of-range
+        payload is included. An independent reader verifies it with
+        :func:`audit_chain.proof.verify_range_proof` and the public digest
+        algorithm alone; damage outside the range cannot change its verdict.
+
+        Raises ``ValueError`` for non-integer/negative bounds, a reversed or
+        empty interval, or an end past the tenant's record count.
+        """
+        if isinstance(start, bool) or isinstance(end, bool) or not (
+            isinstance(start, int) and isinstance(end, int)
+        ):
+            raise ValueError("range bounds must be integers")
+        if start < 0 or end < 0:
+            raise ValueError("range bounds must be non-negative")
+        if start >= end:
+            raise ValueError("range must be non-empty with start < end")
+
+        with self._locked(exclusive=False) as layout:
+            self._require_present(layout)
+            units = self._view(layout)
+            # A physical half-line at the tail of the log keeps the usual
+            # bad-line semantics for every reader, including export; it is
+            # never silently skipped.
+            self._require_clean_tail(units)
+            windows, picked, start_prev, count = self._scan_range(
+                units, tenant, start, end
+            )
+
+        if end > count:
+            raise ValueError(
+                f"end {end} is out of range for {count} record(s)"
+            )
+        return pf.build_proof(tenant, start, end, start_prev, windows, picked)
+
+    def _require_clean_tail(self, units: list[dict]) -> None:
+        """Raise ``ValueError`` on a physical half-written tail line."""
+        if not units:
+            return
+        active = units[-1]
+        try:
+            with open(active["path"], "rb") as handle:
+                handle.seek(0, os.SEEK_END)
+                size = handle.tell()
+                if size == 0:
+                    return
+                handle.seek(-1, os.SEEK_END)
+                last = handle.read(1)
+        except FileNotFoundError:
+            if not active["sealed"]:
+                return
+            raise
+        if last != b"\n":
+            raise ValueError("truncated audit record")
+
+    def _scan_range(
+        self, units: list[dict], tenant: str, start: int, end: int
+    ) -> tuple[list[dict], list[dict], str, int]:
+        """Scan the snapshot for one tenant's range without reading trust.
+
+        Each preserved window is decoded from its *own declared byte slice*,
+        so damage in a window the range never touches -- including windows in
+        earlier/later segments -- cannot change the in-range result. Only the
+        manifest-declared window sizes bound the parsing; the preserved
+        sha256 anchors are carried into the proof for holders of the store and
+        are never needed to locate in-range records.
+
+        Returns ``(windows, picked, start_prev, count)``.
+        """
+        windows: list[dict] = []
+        picked: list[dict] = []
+        start_prev = ""
+        count = 0
+        for unit in units:
+            try:
+                with open(unit["path"], "rb") as handle:
+                    raw = handle.read()
+            except FileNotFoundError:
+                if not unit["sealed"]:
+                    continue
+                raise
+
+            slices: list[tuple[int, int, Optional[str]]] = []
+            running = 0
+            for part in unit["parts"]:
+                slices.append((running, running + part["size"], part["sha256"]))
+                running += part["size"]
+            if not unit["sealed"] and len(raw) > running:
+                # Grown tail of an active/legacy unit: one fresh window.
+                slices.append((running, len(raw), _sha256(raw[running:])))
+
+            for lo, hi, anchor in slices:
+                if hi <= lo:
+                    continue
+                body = raw[lo:hi]
+                order = len(windows)
+                windows.append(
+                    {
+                        "name": unit["name"],
+                        "size": hi - lo,
+                        "sha256": anchor if anchor is not None else _sha256(body),
+                    }
+                )
+                text = body.decode(_ENCODING)
+                # Tolerant per-window scan over every line's bytes. Complete
+                # newline-terminated lines only; a fragment here is corruption
+                # confined to this window (the physical tail half-line is
+                # handled separately). Byte offsets advance over *all* lines,
+                # so honest placement is exact even when foreign garbage is
+                # interleaved.
+                raw_lines = text.split("\n")
+                if raw_lines and raw_lines[-1] == "":
+                    raw_lines = raw_lines[:-1]
+                offset = 0
+                for line in raw_lines:
+                    length = len((line + "\n").encode(_ENCODING))
+                    # A damaged line belonging to another tenant is outside
+                    # the range: skip it without letting it abort the proof,
+                    # while its byte length still advances placement. A
+                    # damaged line of *this* tenant is simply absent, so the
+                    # count/bounds checks below can never return a clean
+                    # proof across it.
+                    record = None
+                    if line != "":
+                        try:
+                            record = rec.parse_line(line)
+                        except ValueError:
+                            record = None
+                    if record is not None and record["tenant"] == tenant:
+                        if count == start:
+                            start_prev = record["prev"]
+                        if start <= count < end:
+                            picked.append(
+                                {
+                                    "index": count,
+                                    "window": order,
+                                    "offset": offset,
+                                    "length": length,
+                                    "record": record,
+                                }
+                            )
+                        count += 1
+                    offset += length
+        return windows, picked, start_prev, count
+
+    # ------------------------------------------------------------------
     # Small helpers
     # ------------------------------------------------------------------
 
-    def _write_bytes(self, directory: str, name: str, raw: bytes) -> None:
-        path = os.path.join(directory, name)
-        with open(path, "wb") as handle:
-            handle.write(raw)
-            handle.flush()
-            os.fsync(handle.fileno())
+    def _write_bytes(
+        self, directory: str, name: str, raw: bytes, *, crash: Optional[str] = None
+    ) -> None:
+        st.atomic_write_bytes(directory, name, raw, crash=crash)
 
     def _delete_cache(self, layout: st.Layout) -> None:
         with contextlib.suppress(FileNotFoundError):
