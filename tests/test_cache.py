@@ -67,6 +67,45 @@ class IncrementalCacheTest(AuditTestCase):
         # One new record plus the small cache tag; nowhere near the file.
         self.assertLess(self.hashed_bytes(), data_size // 50)
 
+    def test_segmented_reverify_is_constant_read_amplification(self) -> None:
+        # Sealed segments are vouched for by their window material; a repeat
+        # verify hashes no sealed data bytes at all, only small sidecars.
+        self.append_many("t", 6000)
+        self.chain.rotate()
+        self.append_many("t", 5, start=6000)
+        sealed = self.segment_files()[0]
+        sealed_size = os.path.getsize(os.path.join(self.path, sealed))
+        self.assertGreater(sealed_size, 100_000)
+        self.assertTrue(self.chain.verify("t")["ok"])
+        self.reset_counter()
+        result = self.chain.verify("t")
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["count"], 6005)
+        # No sealed byte window is re-hashed on the hot path.
+        self.assertLess(self.hashed_bytes(), sealed_size // 50)
+
+    def test_window_material_change_forces_cold_path_and_is_corruption(self) -> None:
+        # Editing a sealed window anchor and re-signing invalidates the
+        # freshness guard: the cold path re-hashes the sealed window once,
+        # the mismatch is reported as corruption at the real first index.
+        self.append_many("t", 300)
+        self.chain.rotate()
+        self.assertTrue(self.chain.verify("t")["ok"])
+        self.reset_counter()
+
+        from audit_chain import storage as st
+
+        layout = st.Layout(self.path, "dir")
+        manifest = st.load_manifest(layout)
+        manifest["segments"][0]["parts"][0]["sha256"] = "a" * 64
+        st.save_manifest(layout, manifest)  # re-signed, so the tag is valid
+
+        result = self.chain.verify("t")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["first_bad"], 0)
+        # Detection genuinely re-hashed the sealed window once.
+        self.assertGreater(self.hashed_bytes(), 1000)
+
     def test_disk_corruption_after_warm_verify_is_detected(self) -> None:
         self.append_many("t", 200)
         self.chain.rotate()
@@ -97,10 +136,14 @@ class IncrementalCacheTest(AuditTestCase):
         raw[40] ^= 0x01
         with open(cache_path, "wb") as fh:
             fh.write(bytes(raw))
-        with self.assertRaises(ValueError):
-            self.chain.verify("t")
+        # A tampered cache is chain corruption (exit-code-1 class), reported
+        # with a first bad index -- never a pass and never a clean rebuild
+        # that would hide the tampering.
+        result = self.chain.verify("t")
+        self.assertFalse(result["ok"])
+        self.assertGreaterEqual(result["first_bad"], 0)
 
-    def test_cache_with_forged_tag_is_rejected(self) -> None:
+    def test_cache_with_forged_tag_is_corruption(self) -> None:
         self.append_many("t", 3)
         cache_path = "." + os.path.basename(self.path) + ".verify-cache"
         full = os.path.join(os.path.dirname(self.path), cache_path)
@@ -112,8 +155,9 @@ class IncrementalCacheTest(AuditTestCase):
         cache["segments"][first_name]["records"] = 999
         with open(full, "w", encoding="utf-8") as fh:
             fh.write(json.dumps(cache))
-        with self.assertRaises(ValueError):
-            self.chain.verify("t")
+        result = self.chain.verify("t")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["first_bad"], 0)
 
     def test_missing_cache_is_rebuilt(self) -> None:
         self.append_many("t", 4)

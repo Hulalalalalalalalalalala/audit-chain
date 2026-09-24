@@ -147,3 +147,59 @@ class CliTest(AuditTestCase):
         self.assertEqual(code, 0)
         self.assertEqual(err, "")
         self.assertEqual(json.loads(out)["segments"], 1)
+
+    def test_export_and_verify_proof_commands(self) -> None:
+        self.append_many("t", 6)
+        self.chain.rotate()
+        self.append_many("t", 4, start=6)
+
+        code, out, err = self.run_cli(
+            "--path", self.path, "export", "t", "--start", "2", "--end", "8"
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(err, "")
+        proof_path = os.path.join(self._tmp, "proof.json")
+        with open(proof_path, "w", encoding="utf-8") as handle:
+            handle.write(out)
+
+        code, out, err = self.run_cli(
+            "verify-proof", proof_path, "--tenant", "t",
+            "--start", "2", "--end", "8",
+        )
+        self.assertEqual(code, 0, err)
+        self.assertEqual(err, "")
+        verdict = json.loads(out)
+        self.assertTrue(verdict["ok"])
+
+    def test_export_illegal_range_is_silent_exit_2(self) -> None:
+        self.append_many("t", 3)
+        code, out, err = self.run_cli(
+            "--path", self.path, "export", "t", "--start", "2", "--end", "2"
+        )
+        self.assertEqual(code, 2)
+        self.assertEqual(out, "")
+        self.assertEqual(err, "")
+
+    def test_verify_proof_failure_is_exit_1(self) -> None:
+        self.append_many("t", 5)
+        code, out, _ = self.run_cli(
+            "--path", self.path, "export", "t", "--start", "0", "--end", "5"
+        )
+        proof = json.loads(out)
+        proof["windows"][0]["records"][2]["record"]["payload"] = {"i": 4242}
+        proof_path = os.path.join(self._tmp, "bad-proof.json")
+        with open(proof_path, "w", encoding="utf-8") as handle:
+            json.dump(proof, handle)
+        code, out, err = self.run_cli("verify-proof", proof_path)
+        self.assertEqual(code, 1)
+        self.assertEqual(err, "")
+        self.assertFalse(json.loads(out)["ok"])
+
+    def test_verify_proof_malformed_file_is_exit_2(self) -> None:
+        proof_path = os.path.join(self._tmp, "malformed.json")
+        with open(proof_path, "w", encoding="utf-8") as handle:
+            handle.write("{not json")
+        code, out, err = self.run_cli("verify-proof", proof_path)
+        self.assertEqual(code, 2)
+        self.assertEqual(out, "")
+        self.assertEqual(err, "")
