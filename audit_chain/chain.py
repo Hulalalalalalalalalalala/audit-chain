@@ -52,6 +52,13 @@ from . import storage as st
 
 _ENCODING = "utf-8"
 _FILE_UNIT = "$"
+# os.open() defaults to text mode on Windows, which silently rewrites "\n"
+# into "\r\n" (and re-translates bytes that already carry CRLF). The record
+# format is defined byte for byte around a single "\n" terminator -- window
+# sizes/hashes, byte offsets and folds all depend on that -- so every data
+# fd must be opened binary. O_BINARY is absent (and therefore zero) on
+# POSIX, where this changes nothing.
+_O_BINARY = getattr(os, "O_BINARY", 0)
 _DEFAULT_LOCK_TIMEOUT = 10.0
 _DEFAULT_MAX_SEGMENTS = 2
 # Present in the store directory while an archive migration is in flight;
@@ -427,7 +434,9 @@ class Chain:
             # leaves a deterministic half line that reopen treats as a bad
             # line, never as a silently repaired record.
             cut = max(1, len(data) // 2)
-            fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+            fd = os.open(
+                target, os.O_WRONLY | os.O_CREAT | os.O_APPEND | _O_BINARY, 0o600
+            )
             try:
                 _write_all(fd, data[:cut])
                 st.crash_point("append:after_first_write")
@@ -514,7 +523,7 @@ class Chain:
             # cached deletion (either the half line still reads as a bad
             # line, or the cache is already gone and the prefix re-derives).
             self._delete_cache(layout)
-            fd = os.open(target, os.O_WRONLY)
+            fd = os.open(target, os.O_WRONLY | _O_BINARY)
             try:
                 os.ftruncate(fd, cut)
                 st.crash_point("recover:after_truncate")
@@ -815,7 +824,9 @@ class Chain:
             # kill anywhere in the middle never reopens onto copies kept in
             # both tiers.
             marker = os.path.join(layout.root, _ARCHIVE_MARKER)
-            fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            fd = os.open(
+                marker, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | _O_BINARY, 0o600
+            )
             os.close(fd)
             st.fsync_dir(layout.root)
             st.crash_point("archive:after_marker")
@@ -946,7 +957,9 @@ class Chain:
         target = os.path.join(directory, name)
         tmp_path = os.path.join(directory, st._tmp_name_for(name))
         try:
-            fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            fd = os.open(
+                tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | _O_BINARY, 0o600
+            )
             try:
                 _write_all(fd, raw)
                 st.crash_point(f"{phase}:before_{kind}_fsync")
