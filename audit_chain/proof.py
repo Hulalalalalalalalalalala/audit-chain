@@ -205,6 +205,47 @@ def verify_proof(
     return _verdict(p_tenant, p_start, p_end, first_bad)
 
 
+def extend_proof(proof: Any, path: str) -> dict:
+    """Continue an exported range proof to the log's current prefix.
+
+    ``proof`` is a previously exported (or combined) range proof and
+    ``path`` the store it was exported from. The result is an ordinary
+    version-1 range proof covering ``[proof["start"], n)``, where ``n``
+    is the tenant's record count at the moment of the read -- the same
+    shape :meth:`audit_chain.Chain.export_range` produces. Only records
+    appended after ``proof["end"]`` are read from the store and chained,
+    so the cost tracks the increment, never the total history length;
+    the increment is spliced onto the input with :func:`combine_proofs`,
+    so the result still carries only in-interval records plus the window
+    anchors needed to attach the chain. With no new records the result
+    is equivalent to the input and its offline verdict is unchanged.
+
+    A non-dict proof raises ``TypeError``; a proof that is malformed
+    (including a reversed interval) or does not verify raises
+    ``ValueError``; a proof whose end lies beyond the log's intact
+    prefix raises ``ValueError``; a missing log raises
+    ``FileNotFoundError``.
+    """
+    if not isinstance(proof, dict):
+        raise TypeError("proof must be a dict")
+    from .chain import Chain
+
+    return Chain(path).extend_proof(proof)
+
+
+def clone_proof(proof: dict) -> dict:
+    """A copy of a verified proof that shares no window or record."""
+    return {
+        "version": proof["version"],
+        "tenant": proof["tenant"],
+        "start": proof["start"],
+        "end": proof["end"],
+        "count": proof["count"],
+        "prev": proof["prev"],
+        "windows": [_clone_window(window) for window in proof["windows"]],
+    }
+
+
 def combine_proofs(left: Any, right: Any) -> dict:
     """Splice two contiguous proofs of the same tenant into one proof.
 

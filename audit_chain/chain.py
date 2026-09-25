@@ -36,6 +36,11 @@ semantics:
 * ``export_range`` produces an offline proof for a contiguous index
   interval: only the interval's records plus the window anchors needed to
   attach the chain, verifiable with the public digest alone;
+* ``extend_proof`` continues an exported proof to the current complete
+  prefix: only the records appended after the proof's end are read and
+  chained, and the increment is spliced on with ``combine_proofs``, so
+  the cost tracks the increment and the result is an ordinary offline
+  proof of the same shape;
 * ``recover`` is the explicit entry point that truncates a half-written
   tail line left by a killed process.
 """
@@ -1810,6 +1815,271 @@ class Chain:
             if cumulative > index:
                 return ui
         return len(counts) - 1
+
+    # ------------------------------------------------------------------
+    # Proof extension (incremental re-export to the current prefix)
+    # ------------------------------------------------------------------
+
+    def extend_proof(self, proof: Any) -> dict:
+        """Continue an exported range proof to the current complete prefix.
+
+        ``proof`` is a previously exported (or combined, or extended)
+        range proof for this store; the result is an ordinary version-1
+        proof covering ``[proof["start"], n)`` where ``n`` is the
+        tenant's record count at the moment of the read -- the same
+        shape :meth:`export_range` produces. Only records appended after
+        ``proof["end"]`` are read from the store and chained, so the
+        cost tracks the increment, never the total history length; the
+        increment is spliced onto the input with
+        :func:`audit_chain.proof.combine_proofs`, so the result carries
+        only in-interval records plus the window anchors needed to
+        attach the chain.
+
+        The read runs under the shared lock, so a concurrent append,
+        rotation, merge or archive migration yields a result for one
+        complete prefix, never a mixed topology. Nothing is written to
+        the store: an interrupted extension leaves no temp files or
+        half-built state behind and can simply be retried. With no new
+        records the returned proof is equivalent to the input and its
+        offline verdict is unchanged.
+
+        A non-dict proof raises ``TypeError``; a proof that is malformed
+        (including a reversed interval) or does not verify raises
+        ``ValueError``; a proof whose end lies beyond the log's intact
+        prefix raises ``ValueError``; a missing log raises
+        ``FileNotFoundError``.
+        """
+        from . import proof as pf
+
+        if not isinstance(proof, dict):
+            raise TypeError("proof must be a dict")
+        verdict = pf.verify_proof(proof)
+        if not verdict["ok"]:
+            raise ValueError("cannot extend: proof does not verify")
+
+        tenant = proof["tenant"]
+        end = proof["end"]
+        with self._locked(exclusive=False) as layout:
+            self._require_present(layout)
+            metadata_damaged = False
+            try:
+                units = self._view(layout)
+            except st.AuditMetadataError:
+                # A rewritten manifest cannot vouch for any window: fall
+                # back to the physically ordered segment files and
+                # re-derive every link from the bytes, exactly like
+                # verify() does.
+                metadata_damaged = True
+                units = self._raw_units(layout)
+            counts, count, bad, cache_damaged = self._extend_states(
+                units, layout, tenant
+            )
+            if bad == -1 and (metadata_damaged or cache_damaged):
+                # The bytes still re-derive, but authentication material
+                # the chain depended on was rewritten: nothing is
+                # vouched for, so the intact prefix is empty.
+                bad = 0
+            if end > count or (bad != -1 and end > bad):
+                raise ValueError("proof end is beyond the intact prefix")
+            if end == count:
+                # No new records: the input proof already names the
+                # complete prefix; return an equivalent copy.
+                return pf.clone_proof(proof)
+            material = self._collect_range_bounded(units, tenant, end, count, counts)
+        increment = pf.build_proof(material)
+        return pf.combine_proofs(proof, increment)
+
+    def _extend_states(
+        self, units: list[dict], layout: st.Layout, tenant: str
+    ) -> tuple[list[int], int, int, bool]:
+        """Tenant counts per unit, the total, the intact prefix, cache damage.
+
+        Returns ``(counts, total, bad, cache_damaged)`` where
+        ``counts[i]`` is the tenant's cumulative record count after unit
+        ``i``, ``total`` the full count and ``bad`` the first index
+        whose chain link does not re-derive (``-1`` when the walked
+        prefix is intact).
+
+        A unit whose authenticated cache entry is still fresh
+        contributes its cumulative count with no byte reads; an active
+        unit that grew since caching authenticates its cached prefix
+        through the stored fold and contributes only its appended
+        suffix; any other changed unit is re-chained from its bytes.
+        With a warm verify cache the work therefore tracks the
+        increment, never the sealed history.
+        """
+        try:
+            cache = st.load_cache(layout)
+            cache_damaged = False
+        except st.AuditMetadataError:
+            # A tampered cache is neither trusted nor silently rebuilt:
+            # every unit is re-chained from bytes and the damage is
+            # reported to the caller.
+            cache = None
+            cache_damaged = True
+        cached = {} if cache is None else cache["segments"]
+
+        counts: list[int] = []
+        count, head, bad = 0, "", -1
+        # Once any unit is re-chained outside its cache, the cached
+        # cumulative states of every later unit were derived from the old
+        # prefix and can no longer be adopted.
+        desynced = False
+        for unit in units:
+            entry = cached.get(unit["name"])
+            try:
+                stat = os.stat(unit["path"])
+            except FileNotFoundError:
+                if not unit["sealed"]:
+                    # Active unit not created yet: no records beyond the
+                    # counts so far.
+                    counts.append(count)
+                    continue
+                raise
+
+            if (
+                entry is not None
+                and not desynced
+                and self._entry_fresh(entry, stat, unit)
+            ):
+                state = entry["tenants"].get(tenant)
+                if state is not None:
+                    # A cache is only ever persisted by a clean walk, so
+                    # the adopted bad marker is always -1.
+                    count, head, bad = state
+                counts.append(count)
+                continue
+
+            raw: Optional[bytes] = None
+            fold = entry.get("fold") if entry is not None else None
+            if (
+                entry is not None
+                and fold is not None
+                and not desynced
+                and not unit["sealed"]
+                and stat.st_size > entry["size"]
+                and entry.get("parts", []) == unit["parts"]
+            ):
+                # Appended-only growth on the active unit: the cached
+                # prefix authenticates itself byte for byte through the
+                # fold before its cumulative state is continued over the
+                # appended suffix alone.
+                with open(unit["path"], "rb") as handle:
+                    raw = handle.read()
+                prefix_lines = _split_whole_lines(raw[: entry["size"]])
+                if prefix_lines is not None and _fold_lines(prefix_lines) == fold:
+                    state = entry["tenants"].get(tenant)
+                    if state is not None:
+                        count, head, bad = state
+                    count, head, bad = self._chain_unit_bytes(
+                        unit,
+                        raw[entry["size"] :],
+                        tenant,
+                        count,
+                        head,
+                        bad,
+                        parts=[],
+                    )
+                    counts.append(count)
+                    continue
+                # The cached prefix no longer matches the bytes: fall
+                # through and re-derive this unit completely.
+
+            # Cold unit: re-chain from bytes.
+            desynced = True
+            if raw is None:
+                with open(unit["path"], "rb") as handle:
+                    raw = handle.read()
+            count, head, bad = self._chain_unit_bytes(
+                unit, raw, tenant, count, head, bad
+            )
+            if entry is not None and bad == -1:
+                # The surviving cache anchors what this unit's cumulative
+                # tenant state must be: a rewrite that re-derives cleanly
+                # but lands on different counts or heads is a rewritten
+                # history, vouched for from index zero.
+                anchored = entry["tenants"].get(tenant)
+                if anchored is not None and (
+                    count != anchored[0] or head != anchored[1]
+                ):
+                    bad = 0
+            counts.append(count)
+        return counts, count, bad, cache_damaged
+
+    @staticmethod
+    def _chain_unit_bytes(
+        unit: dict,
+        raw: bytes,
+        tenant: str,
+        count: int,
+        head: str,
+        bad: int,
+        *,
+        parts: Optional[list[dict]] = None,
+    ) -> tuple[int, str, int]:
+        """Chain one tenant's records in ``raw`` onto ``(count, head, bad)``.
+
+        Counting and skipping mirror the range collector exactly: only
+        complete newline-terminated lines are considered, malformed
+        lines and a trailing half line are skipped, and only the
+        tenant's own records extend the chain. Preserved byte windows
+        are re-authenticated; a tenant record inside a failed window,
+        straddling a window boundary or past a sealed unit's frozen
+        material flags the tenant at that record's global index.
+        """
+        if parts is None:
+            parts = unit["parts"]
+        window_ends: list[int] = []
+        running = 0
+        for part in parts:
+            running += part["size"]
+            window_ends.append(running)
+        failed: set[int] = set()
+        if parts:
+            if unit["sealed"] and len(raw) != running:
+                failed.update(range(len(parts)))
+            else:
+                window_start = 0
+                for part in parts:
+                    if _sha256(raw[window_start : window_start + part["size"]]) != part[
+                        "sha256"
+                    ]:
+                        failed.update(range(len(parts)))
+                        break
+                    window_start += part["size"]
+
+        pos = 0
+        win_index = 0
+        for line_raw in raw.split(b"\n")[:-1]:
+            line_start = pos
+            line_end = pos + len(line_raw) + 1
+            pos = line_end
+            try:
+                record = st.decode_records(line_raw + b"\n")[0]
+            except ValueError:
+                continue
+            if record["tenant"] != tenant:
+                continue
+            while win_index < len(window_ends) and line_start >= window_ends[win_index]:
+                win_index += 1
+            past_end = win_index >= len(window_ends)
+            if bad == -1:
+                if not past_end and win_index in failed:
+                    bad = count
+                elif not past_end and line_end > window_ends[win_index]:
+                    # Windows only ever concatenate whole lines, so a
+                    # record may never straddle a window boundary.
+                    bad = count
+                elif unit["sealed"] and past_end:
+                    # Bytes appended past a sealed unit's frozen material.
+                    bad = count
+            recomputed = rec.digest(record["prev"], record["payload"])
+            if record["prev"] != head or record["digest"] != recomputed:
+                if bad == -1:
+                    bad = count
+            head = record["digest"]
+            count += 1
+        return count, head, bad
 
     def _delete_cache(self, layout: st.Layout) -> None:
         with contextlib.suppress(FileNotFoundError):

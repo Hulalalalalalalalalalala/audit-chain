@@ -70,6 +70,16 @@ Two more offline entry points work purely on proof objects (no log):
   real global bad index without interrupting the rest. An empty list is
   `ValueError`; the argument or an element that is not a dict is `TypeError`.
 
+`audit_chain.extend_proof(proof, path) -> dict` continues an exported (or
+combined) proof against the store at `path`: the result is an ordinary proof
+covering `[proof["start"], n)`, where `n` is the tenant's record count at the
+moment of the read. Only the records appended after `proof["end"]` are read
+and chained, so the cost tracks the increment, never the history length; the
+increment is spliced on with `combine_proofs`. With no new records the result
+is equivalent to the input. A non-dict proof is `TypeError`; a malformed,
+reversed or non-verifying proof, or one whose end lies beyond the log's
+intact prefix, is `ValueError`; a missing log is `FileNotFoundError`.
+
 ### Online archiving
 
 `archive(archive_dir)` moves every sealed segment out of the hot store
@@ -133,10 +143,19 @@ compaction, and across the cross-segment window chain; it stays verifiable
 after the log is compacted, corrupted or deleted. `verify_proofs` verifies
 many proofs at once, one verdict each in order.
 
+An exported proof can later be continued with `extend_proof(proof, path)`:
+the extension reads only the records appended after the proof's end — under
+the same shared lock as every other read, so a concurrent append, rotation,
+merge or archive migration yields a result for one complete prefix, never a
+mixed topology — and splices the increment on with `combine_proofs`. The
+result is an ordinary proof to the current prefix; it writes nothing to the
+store, so an interrupted extension leaves no temp files or half-built state
+and can simply be retried.
+
 ### Export cost
 
-Exporting (and splicing, and batch verification) costs work proportional to
-the interval, not to total history length. With a warm, authenticated verify
+Exporting (and extending, and splicing, and batch verification) costs work
+proportional to the interval or increment, not to total history length. With a warm, authenticated verify
 cache an export opens only the segment files that hold an interval record and
 reads no others; records in sealed segments are anchored straight from the
 signed manifest material, so sealed bytes are never hashed, and records in the
