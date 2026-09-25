@@ -34,9 +34,24 @@ _ENCODING = "utf-8"
 LOCK_SUFFIX = ".lock"
 MANIFEST_NAME = "manifest.json"
 CACHE_NAME = ".verify-cache"
+# Sentinel marking a tier migration in flight. It is created and fsynced
+# before the manifest commits any ``moving`` segment and removed only after
+# the migration finalizes, so a shared reader can detect the transient
+# topology with one cheap stat -- never by loading the manifest on the hot
+# path. A stale sentinel (the process died before the manifest commit) is
+# reaped by the next exclusive lock holder.
+ARCHIVING_NAME = ".archiving"
 SEG_PREFIX = "seg-"
 SEG_SUFFIX = ".jsonl"
 FIRST_SEQ = 1
+# Segment residency, recorded and signed in the manifest:
+# * ``hot``     -- bytes live in the store directory (the baseline layout);
+# * ``archive`` -- bytes live in the registered archive directory;
+# * ``moving``  -- bytes are committed to both tiers by an in-flight archive
+#                  and the migration is finished (or rolled back) on reopen.
+LOCATION_HOT = "hot"
+LOCATION_ARCHIVE = "archive"
+LOCATION_MOVING = "moving"
 _CHUNK = 1 << 20
 _LOCK_POLL_SECONDS = 0.01
 _tmp_counter = itertools.count()
@@ -182,7 +197,10 @@ class Layout:
         self.root = root
         self.kind = kind  # "dir" or "file"
         # The lock is a sibling dotfile in both layouts, so its identity is
-        # stable across the file -> segment-store migration.
+        # stable across the file -> segment-store migration. The archive
+        # tier's location is not stored here: it is recorded and signed in
+        # the manifest, the single authority for which tier a segment lives
+        # in.
         normalized = os.path.normpath(root)
         parent = os.path.dirname(normalized) or "."
         self.lock_path = os.path.join(
@@ -387,13 +405,18 @@ def default_manifest(first: str) -> dict:
 
 
 def _manifest_payload_text(manifest: dict) -> str:
-    return rec.canonical_json(
-        {
-            "version": manifest["version"],
-            "active": manifest["active"],
-            "segments": manifest["segments"],
-        }
-    )
+    body = {
+        "version": manifest["version"],
+        "active": manifest["active"],
+        "segments": manifest["segments"],
+    }
+    # The archive binding only enters the signed payload once an archive
+    # exists; omitting it keeps the signed bytes of a hot-only manifest
+    # (including every pre-archive store on disk) byte-identical.
+    archive = manifest.get("archive")
+    if archive is not None:
+        body["archive"] = archive
+    return rec.canonical_json(body)
 
 
 def sign_manifest(manifest: dict) -> dict:
@@ -403,6 +426,9 @@ def sign_manifest(manifest: dict) -> dict:
         "active": manifest["active"],
         "segments": manifest["segments"],
     }
+    archive = manifest.get("archive")
+    if archive is not None:
+        signed["archive"] = archive
     signed["tag"] = hashlib.sha256(
         _manifest_payload_text(signed).encode(_ENCODING)
     ).hexdigest()
@@ -440,6 +466,9 @@ def _valid_manifest(manifest: Any) -> bool:
         return False
     if manifest.get("version") != 1 or not isinstance(manifest.get("active"), str):
         return False
+    archive = manifest.get("archive")
+    if archive is not None and not isinstance(archive, str):
+        return False
     segments = manifest.get("segments")
     if not isinstance(segments, list) or not segments:
         return False
@@ -450,6 +479,9 @@ def _valid_manifest(manifest: Any) -> bool:
             segment.get("sealed"), bool
         ):
             return False
+        location = segment.get("location", LOCATION_HOT)
+        if location not in (LOCATION_HOT, LOCATION_ARCHIVE, LOCATION_MOVING):
+            return False
         parts = segment.get("parts")
         if not isinstance(parts, list):
             return False
@@ -459,7 +491,13 @@ def _valid_manifest(manifest: Any) -> bool:
         if index == len(segments) - 1:
             if segment["name"] != manifest["active"] or segment["sealed"]:
                 return False
+            # The active segment is always appended to, so it can never live
+            # in the archive.
+            if location != LOCATION_HOT:
+                return False
         elif not segment["sealed"] or not parts:
+            return False
+        elif archive is None and location != LOCATION_HOT:
             return False
     tag = manifest.get("tag")
     if tag is not None and not isinstance(tag, str):

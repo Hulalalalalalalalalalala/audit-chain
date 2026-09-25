@@ -5,6 +5,7 @@
     python -m audit_chain --path <log> recover
     python -m audit_chain --path <log> rotate
     python -m audit_chain --path <log> compact [--max-segments N]
+    python -m audit_chain --path <log> archive <archive-dir>
     python -m audit_chain --path <log> export <tenant> --start N --end M
     python -m audit_chain verify-proof <proof-file> [--tenant T] [--start N] [--end M]
 
@@ -63,6 +64,11 @@ def _build_parser() -> argparse.ArgumentParser:
         default=2,
         help="fold the log until at most this many segments remain",
     )
+
+    archive_parser = subparsers.add_parser(
+        "archive", help="move sealed segments online to an archive directory"
+    )
+    archive_parser.add_argument("archive_dir", help="caller-supplied archive path")
 
     export_parser = subparsers.add_parser(
         "export", help="export an offline range proof [start, end)"
@@ -132,6 +138,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
         if args.command == "compact":
             result = chain.compact(args.max_segments)
+            sys.stdout.write(_compact(result) + "\n")
+            return 0
+
+        if args.command == "archive":
+            result = chain.archive(args.archive_dir)
             sys.stdout.write(_compact(result) + "\n")
             return 0
 

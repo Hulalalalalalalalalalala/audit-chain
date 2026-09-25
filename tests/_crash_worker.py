@@ -18,6 +18,7 @@ from audit_chain import Chain  # noqa: E402
 def main() -> None:
     path, operation, crash_point = sys.argv[1], sys.argv[2], sys.argv[3]
     index = int(sys.argv[4]) if len(sys.argv) > 4 else 0
+    archive_dir = sys.argv[5] if len(sys.argv) > 5 else None
     if crash_point:
         os.environ["AUDIT_CHAIN_CRASH"] = crash_point
     chain = Chain(path)
@@ -31,6 +32,8 @@ def main() -> None:
         chain.compact(2)
     elif operation == "recover":
         chain.recover()
+    elif operation == "archive":
+        chain.archive(archive_dir)
     else:  # pragma: no cover - test harness error
         raise SystemExit(f"unknown operation {operation}")
 

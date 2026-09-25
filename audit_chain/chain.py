@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import json
 import os
 from typing import Any, Optional
 
@@ -113,21 +114,43 @@ class Chain:
                 yield layout
                 return
 
+    def _archiving_sentinel(self, layout: st.Layout) -> str:
+        return os.path.join(layout.root, st.ARCHIVING_NAME)
+
+    @staticmethod
+    def _is_nested(a: str, b: str) -> bool:
+        """Whether directories ``a`` and ``b`` contain one another."""
+        sep = os.sep
+        return a.startswith(b + sep) or b.startswith(a + sep)
+
     def _needs_healing(self, layout: st.Layout) -> bool:
         """Whether a shared read must escalate to heal before reading.
 
-        A read only escalates when the live path is absent and a migration
-        backup is waiting -- without adoption there is nothing to read.
-        Every other leftover (staging directory, an unreferenced segment
-        from a rotation/compaction killed before/after its manifest commit,
-        a merge temp file, a post-publish backup) is inert while the
+        A read escalates when the live path is absent and a migration backup
+        is waiting (without adoption there is nothing to read), or when the
+        cheap ``.archiving`` sentinel marks a tier migration in flight: that
+        topology is deliberately short-lived (bytes may sit in both
+        directories or already be gone from the hot one), so the move is
+        finished (or rolled back) before any read is served. Both checks are
+        plain stats -- the hot read path never loads the manifest just to
+        decide. Every other leftover (a staging directory, an unreferenced
+        segment from a rotation/compaction killed before/after its manifest
+        commit, a merge temp file, a post-publish backup, an unreferenced
+        archive-side copy killed before its commit) is inert while the
         committed manifest stays authoritative, so reads leave it untouched
         and the next writer (exclusive) reaps it -- matching the baseline
         rule that reads never move garbage out from under other readers.
         """
-        return not os.path.exists(self.path) and os.path.exists(
+        if not os.path.exists(self.path) and os.path.exists(
             self.path + ".pre-segment"
-        )
+        ):
+            return True
+        if (
+            layout.kind == "dir"
+            and os.path.exists(self._archiving_sentinel(layout))
+        ):
+            return True
+        return False
 
     def _reap_crash_leftovers(self, layout: st.Layout) -> None:
         """Deterministically finish every crash window's housekeeping."""
@@ -153,14 +176,46 @@ class Chain:
         with contextlib.suppress(st.AuditMetadataError):
             manifest = st.load_manifest(layout)
         if manifest is not None:
+            # Finish or roll back a tier migration killed mid-flight before
+            # any other garbage collection looks at the segment directories.
+            self._finish_archive_migration(layout, manifest)
+            # Reconcile the in-flight sentinel: drop archive-side orphans of
+            # a migration killed before its commit, keep the copies of one
+            # that finalized, and always clear the sentinel afterwards.
+            self._reconcile_archiving_sentinel(layout, manifest)
             self._gc_segments(layout, manifest)
-        # Temp files of killed atomic writes/merges (never the lock).
-        if os.path.isdir(layout.root):
-            for name in os.listdir(layout.root):
-                if name.startswith(".") and name.endswith(".tmp"):
-                    with contextlib.suppress(OSError):
-                        os.remove(os.path.join(layout.root, name))
+            self._gc_temp_files(layout.root)
+            archive_dir = manifest.get("archive")
+            if archive_dir:
+                self._gc_temp_files(archive_dir)
+
+    def _reconcile_archiving_sentinel(
+        self, layout: st.Layout, manifest: dict
+    ) -> None:
+        """Retire a stale archive sentinel after migration bookkeeping.
+
+        The sentinel carries no state: by the time this runs,
+        ``_finish_archive_migration`` has finalized every ``moving`` segment
+        and ``_gc_segments`` has reaped any pre-commit orphan in the archive.
+        A sentinel left behind by a kill is therefore safe to drop.
+        """
+        sentinel = self._archiving_sentinel(layout)
+        if os.path.exists(sentinel):
+            with contextlib.suppress(OSError):
+                os.remove(sentinel)
             st.fsync_dir(layout.root)
+
+    def _write_archiving_sentinel(self, layout: st.Layout) -> None:
+        st.atomic_write_text(layout.root, st.ARCHIVING_NAME, "")
+
+    def _gc_temp_files(self, directory: str) -> None:
+        if not os.path.isdir(directory):
+            return
+        for name in os.listdir(directory):
+            if name.startswith(".") and name.endswith(".tmp"):
+                with contextlib.suppress(OSError):
+                    os.remove(os.path.join(directory, name))
+        st.fsync_dir(directory)
 
     @staticmethod
     def _remove_tree(path: str) -> None:
@@ -192,6 +247,11 @@ class Chain:
         A unit is the legacy single file or one manifest segment. Sealed
         units carry preserved byte windows (verification material); the
         active unit and the legacy file are fingerprinted as they grow.
+
+        A sealed segment may live in the registered archive directory rather
+        than the hot store; its unit resolves to the archive path while its
+        order, name and verification material stay unchanged, so every
+        higher-level operation works across both tiers as one log.
         """
         if layout.kind == "file":
             return [
@@ -200,6 +260,7 @@ class Chain:
                     "path": layout.root,
                     "sealed": False,
                     "parts": [],
+                    "location": st.LOCATION_HOT,
                 }
             ]
 
@@ -210,38 +271,77 @@ class Chain:
             # collision, never an implicit store.
             raise ValueError("missing audit manifest")
 
-        return [
-            {
-                "name": segment["name"],
-                "path": layout.segment_path(segment["name"]),
-                "sealed": segment["sealed"],
-                "parts": [dict(part) for part in segment["parts"]],
-            }
-            for segment in manifest["segments"]
-        ]
+        archive_dir = manifest.get("archive")
+        units = []
+        for segment in manifest["segments"]:
+            name = segment["name"]
+            location = segment.get("location", st.LOCATION_HOT)
+            if location == st.LOCATION_HOT or not archive_dir:
+                path = layout.segment_path(name)
+            else:
+                path = os.path.join(archive_dir, name)
+            units.append(
+                {
+                    "name": name,
+                    "path": path,
+                    "sealed": segment["sealed"],
+                    "parts": [dict(part) for part in segment["parts"]],
+                    "location": location,
+                }
+            )
+        return units
 
-    def _raw_units(self, layout: st.Layout) -> list[dict]:
+    def _raw_units(
+        self, layout: st.Layout, archive_dir: Optional[str] = None
+    ) -> list[dict]:
         """Units reconstructed from ordered segment file names alone.
 
         Used when the manifest cannot be trusted: the records themselves
         still carry the chain, so the real first bad index stays derivable.
+        When the store is tiered the segment files are gathered from the hot
+        directory and the archive directory (a path read out of the damaged
+        manifest is used purely as a search location -- it vouches for
+        nothing because every link is re-derived from the bytes).
         """
         if layout.kind == "file":
             return self._view(layout)
-        names = sorted(
-            name
-            for name in os.listdir(layout.root)
-            if st.seg_seq(name) is not None
-        )
+        directories = [layout.root]
+        if archive_dir and os.path.isdir(archive_dir):
+            directories.append(archive_dir)
+        seen: dict[str, str] = {}
+        for directory in directories:
+            for name in os.listdir(directory):
+                if st.seg_seq(name) is not None and name not in seen:
+                    # The hot directory wins on a name collision so a stale
+                    # archive-side copy can never shadow the live topology.
+                    seen.setdefault(name, directory)
         return [
             {
                 "name": name,
-                "path": layout.segment_path(name),
+                "path": os.path.join(directory, name),
                 "sealed": False,
                 "parts": [],
+                "location": st.LOCATION_HOT,
             }
-            for name in names
+            for name, directory in sorted(seen.items())
         ]
+
+    def _peek_archive_dir(self, layout: st.Layout) -> Optional[str]:
+        """Best-effort read of the archive path from an unverified manifest.
+
+        Used only to pick extra search locations for the damaged-manifest
+        fallback; the value authenticates nothing.
+        """
+        try:
+            with open(layout.manifest_path, "rb") as handle:
+                raw = handle.read()
+            body = json.loads(raw.decode(_ENCODING))
+        except (OSError, UnicodeDecodeError, ValueError):
+            return None
+        if not isinstance(body, dict):
+            return None
+        archive = body.get("archive")
+        return archive if isinstance(archive, str) else None
 
     # ------------------------------------------------------------------
     # Raw reads (entries/head; structure only, no chain or cache)
@@ -267,7 +367,7 @@ class Chain:
         except st.AuditMetadataError:
             if not tolerate_metadata:
                 raise
-            return self._raw_units(layout)
+            return self._raw_units(layout, self._peek_archive_dir(layout))
 
     def _tenant_records(self, tenant: str, *, missing_empty: bool) -> list[dict]:
         with self._locked(exclusive=False) as layout:
@@ -317,7 +417,7 @@ class Chain:
                 # back to the physically ordered segment files and re-derive
                 # every link from the bytes themselves.
                 metadata_damaged = True
-                units = self._raw_units(layout)
+                units = self._raw_units(layout, self._peek_archive_dir(layout))
 
             try:
                 states, _ = self._walk(
@@ -376,8 +476,9 @@ class Chain:
         with self._locked(exclusive=True) as layout:
             units = self._view(layout)
 
-            # Refuse to extend a damaged log.
-            states, _ = self._walk(units, layout)
+            # Refuse to extend a damaged log. This walk also persists a warm
+            # cache entry for every unit, including the active one.
+            states, entries = self._walk(units, layout)
             for _count, _head, bad in states.values():
                 if bad != -1:
                     raise ValueError("corrupt audit chain")
@@ -386,6 +487,26 @@ class Chain:
             record, line = rec.build_line(tenant, payload, prev)
             target = units[-1]["path"]
             data = (line + "\n").encode(_ENCODING)
+            active_name = units[-1]["name"]
+            active_entry = entries.get(active_name)
+            first_creation = active_entry is None and active_name == _FILE_UNIT
+            if first_creation:
+                # The legacy file did not exist before its first append; the
+                # walk skipped the missing unit. The written line is the
+                # whole file, so its fold extends safely from the blank seed.
+                base_fold, base_records, base_parts = _FOLD_BLANK, 0, []
+            elif active_entry is not None and active_entry.get("fold") is not None:
+                base_fold, base_records, base_parts = (
+                    active_entry["fold"],
+                    active_entry["records"],
+                    active_entry.get("parts", []),
+                )
+            else:
+                # A surviving pre-fold cache or an uncacheable prefix: do not
+                # extend from a guessed fold. The walk above already cached
+                # the pre-write prefix; the next read authenticates that
+                # boundary itself and continues past it.
+                base_fold = None
             # Two raw writes with a real kill point between them model the
             # write/flush/fsync crash window: a kill after the first syscall
             # leaves a deterministic half line that reopen treats as a bad
@@ -402,12 +523,25 @@ class Chain:
             finally:
                 os.close(fd)
 
-            # Warm the cache with the single record just written: suffix
-            # only, never a rehash of the whole file. This call is still
-            # inside the exclusive lock and the prefix could not have changed
-            # since the states above were computed, so the continuation is
-            # trusted by construction.
-            self._walk(self._view(layout), layout, trust_growth=True)
+            # Warm the cache over the single record just written. The prefix
+            # fold and cumulative states come from the walk taken *before*
+            # the write under this same exclusive lock, and the appended
+            # bytes are the exact bytes this call produced -- nothing is
+            # read back and trusted from disk, so there is no window in
+            # which a rewritten prefix could ride the continuation. A later
+            # reader re-authenticates this cached prefix byte for byte
+            # (fold check) before continuing past it.
+            if base_fold is not None:
+                count, _head, bad = states.get(tenant, (0, "", -1))
+                states[tenant] = (count + 1, record["digest"], bad)
+                entries[active_name] = _cache_entry(
+                    base_records + 1,
+                    os.stat(target),
+                    base_parts,
+                    states,
+                    _extend_fold(base_fold, [data]),
+                )
+                st.save_cache(layout, entries)
         return record
 
     # ------------------------------------------------------------------
@@ -643,15 +777,24 @@ class Chain:
             manifest = st.load_manifest(layout)
             cache = st.load_cache(layout)
             cache_segments = {} if cache is None else dict(cache["segments"])
+            # Physical path of every segment a merge can read: starts from
+            # the current two-tier topology and gains each freshly merged
+            # (always hot) segment, so a multi-round fold never loses the
+            # path of an intermediate result.
+            path_map = {unit["name"]: unit["path"] for unit in units}
 
             if max_segments == 1 and len(manifest["segments"]) > 1:
-                removed = self._merge_all(layout, manifest, cache_segments)
+                removed_paths = self._merge_all(
+                    layout, path_map, manifest, cache_segments
+                )
             else:
-                removed: list[str] = []
+                removed_paths: list[str] = []
                 while len(manifest["segments"]) > max_segments:
-                    removed += self._merge_pair(layout, manifest, cache_segments)
+                    removed_paths += self._merge_pair(
+                        layout, path_map, manifest, cache_segments
+                    )
 
-            if removed:
+            if removed_paths:
                 # Commit the new topology first; the now-unreferenced
                 # sources are removed after the durable manifest swap and
                 # otherwise garbage collected on the next open, so a crash
@@ -659,26 +802,106 @@ class Chain:
                 st.save_manifest(layout, manifest)
                 st.crash_point("compact:after_manifest")
                 st.save_cache(layout, cache_segments)
-                for name in removed:
+                for path in removed_paths:
                     with contextlib.suppress(FileNotFoundError):
-                        os.remove(layout.segment_path(name))
+                        os.remove(path)
                     st.crash_point("compact:during_delete")
                 st.fsync_dir(layout.root)
+                archive_dir = manifest.get("archive")
+                if archive_dir:
+                    st.fsync_dir(archive_dir)
                 st.crash_point("compact:after_delete")
             count = len(manifest["segments"])
         return {"segments": count}
 
     def _gc_segments(self, layout: st.Layout, manifest: dict) -> None:
-        """Remove segment files not referenced by the committed manifest."""
-        referenced = {segment["name"] for segment in manifest["segments"]}
+        """Remove segment files not referenced by the committed manifest.
+
+        The reference set is computed per tier: a ``hot`` segment must live
+        in the store directory and an ``archive`` segment in the registered
+        archive directory. A stale copy on the wrong tier is unreferenced
+        garbage and is reaped (e.g. an archive-side copy made by an archive
+        killed before its manifest commit).
+        """
+        archive_dir = manifest.get("archive")
+        hot_refs = {
+            segment["name"]
+            for segment in manifest["segments"]
+            if segment.get("location", st.LOCATION_HOT) == st.LOCATION_HOT
+        }
+        self._gc_dir(layout.root, hot_refs)
+        if archive_dir:
+            archive_refs = {
+                segment["name"]
+                for segment in manifest["segments"]
+                if segment.get("location") == st.LOCATION_ARCHIVE
+            }
+            self._gc_dir(archive_dir, archive_refs)
+
+    @staticmethod
+    def _gc_dir(directory: str, referenced: set[str]) -> None:
+        if not os.path.isdir(directory):
+            return
         changed = False
-        for name in os.listdir(layout.root):
+        for name in os.listdir(directory):
             if st.seg_seq(name) is not None and name not in referenced:
                 with contextlib.suppress(OSError):
-                    os.remove(layout.segment_path(name))
+                    os.remove(os.path.join(directory, name))
                     changed = True
         if changed:
-            st.fsync_dir(layout.root)
+            st.fsync_dir(directory)
+
+    def _finish_archive_migration(self, layout: st.Layout, manifest: dict) -> None:
+        """Land a killed archive on one complete topology.
+
+        A segment left ``moving`` had its bytes copied and authenticated in
+        both tiers before the manifest commit, so the crash-free resolution
+        is always forward: the verified archive copy stays, every hot-side
+        copy is removed, and the segment is finalized as ``archive``. If the
+        archive copy is missing or no longer authenticates (e.g. the archive
+        volume was lost), the migration is rolled back to the pre-archive
+        topology instead: the hot copy is authoritative, any archive-side
+        remnant is removed and the segment is ``hot`` again. Either way a
+        reopen never sees a half segment or copies in both tiers.
+        """
+        moving = [
+            segment
+            for segment in manifest["segments"]
+            if segment.get("location") == st.LOCATION_MOVING
+        ]
+        if not moving:
+            return
+        archive_dir = manifest.get("archive")
+        changed = False
+        for segment in moving:
+            name = segment["name"]
+            hot_path = layout.segment_path(name)
+            archive_path = (
+                os.path.join(archive_dir, name) if archive_dir else None
+            )
+            archive_ready = (
+                archive_path is not None
+                and os.path.exists(archive_path)
+                and st.verify_windows(archive_path, segment["parts"])
+            )
+            if archive_ready:
+                if os.path.exists(hot_path):
+                    with contextlib.suppress(FileNotFoundError):
+                        os.remove(hot_path)
+                    st.fsync_dir(layout.root)
+                segment["location"] = st.LOCATION_ARCHIVE
+            else:
+                if archive_path is not None and os.path.exists(archive_path):
+                    with contextlib.suppress(OSError):
+                        os.remove(archive_path)
+                    st.fsync_dir(archive_dir)
+                # ``hot`` is the signed default: drop the key rather than
+                # persist it, so a rolled-back manifest is byte-identical to
+                # the pre-archive one.
+                segment.pop("location", None)
+            changed = True
+        if changed:
+            st.save_manifest(layout, manifest)
 
     def _publish_bytes(self, layout: st.Layout, name: str, raw: bytes) -> str:
         """Stage ``raw`` in a temp file and rename it to segment ``name``."""
@@ -703,13 +926,18 @@ class Chain:
         return target
 
     def _merge_all(
-        self, layout: st.Layout, manifest: dict, cache_segments: dict
+        self,
+        layout: st.Layout,
+        path_map: dict[str, str],
+        manifest: dict,
+        cache_segments: dict,
     ) -> list[str]:
         """Fold every segment, active included, into one active segment."""
         sources = manifest["segments"]
-        merged, parts, carried = self._compose(layout, sources, cache_segments)
+        merged, parts, carried = self._compose(sources, path_map, cache_segments)
         name = st.seg_name(max(st.seg_seq(s["name"]) for s in sources) + 1)
         target = self._publish_bytes(layout, name, merged)
+        path_map[name] = target
         for source in sources:
             cache_segments.pop(source["name"], None)
         if carried is not None:
@@ -724,18 +952,23 @@ class Chain:
             {"name": name, "sealed": False, "parts": parts}
         ]
         manifest["active"] = name
-        return [source["name"] for source in sources]
+        return [path_map[source["name"]] for source in sources]
 
     def _merge_pair(
-        self, layout: st.Layout, manifest: dict, cache_segments: dict
+        self,
+        layout: st.Layout,
+        path_map: dict[str, str],
+        manifest: dict,
+        cache_segments: dict,
     ) -> list[str]:
         """Merge the two oldest segments into one new sealed segment."""
         sources = manifest["segments"][:2]
-        merged, parts, carried = self._compose(layout, sources, cache_segments)
+        merged, parts, carried = self._compose(sources, path_map, cache_segments)
         name = st.seg_name(
             max(st.seg_seq(s["name"]) for s in manifest["segments"]) + 1
         )
         target = self._publish_bytes(layout, name, merged)
+        path_map[name] = target
         manifest["segments"] = [
             {"name": name, "sealed": True, "parts": parts}
         ] + manifest["segments"][2:]
@@ -749,16 +982,19 @@ class Chain:
                 _states_from(carried),
                 _fold_of_bytes(merged),
             )
-        return [source["name"] for source in sources]
+        return [path_map[source["name"]] for source in sources]
 
     def _compose(
-        self, layout: st.Layout, sources: list[dict], cache_segments: dict
+        self,
+        sources: list[dict],
+        unit_paths: dict[str, str],
+        cache_segments: dict,
     ) -> tuple[bytes, list[dict], Optional[dict]]:
         """Concatenate source bytes and windows, carrying warm cached states."""
         chunks: list[bytes] = []
         parts: list[dict] = []
         for source in sources:
-            path = layout.segment_path(source["name"])
+            path = unit_paths[source["name"]]
             with open(path, "rb") as handle:
                 data = handle.read()
             if source["sealed"]:
@@ -796,6 +1032,196 @@ class Chain:
             }
         return b"".join(chunks), parts, carried
 
+    # ------------------------------------------------------------------
+    # Online archival (hot store -> archive store)
+    # ------------------------------------------------------------------
+
+    def archive(self, archive_dir: str) -> dict:
+        """Move sealed segments online from the hot store to ``archive_dir``.
+
+        The archive location is supplied by the caller and is recorded (and
+        signed) in the manifest. Every selected segment is copied and
+        authenticated in the archive before a single manifest commit flips
+        its residency through ``moving``; the hot-side copy is removed only
+        after that commit and the segment is then finalized as ``archive``.
+        Readers and writers hold the same cross-process lock, and any
+        concurrent operation that finds a ``moving`` topology finishes (or
+        rolls back) the migration under an exclusive lock before serving, so
+        every call still observes one complete prefix: never a half segment,
+        duplicated run or skipped run.
+
+        Returns ``{"archived": n}``. Raises ``ValueError`` when the log is
+        not a segment store, is corrupt, or is already bound to a different
+        archive location; filesystem/permission errors propagate as
+        ``OSError`` (the CLI reports both silently with exit code 2).
+        """
+        if not isinstance(archive_dir, str) or not archive_dir:
+            raise ValueError("archive_dir must be a non-empty path")
+        archive_dir = os.path.abspath(archive_dir)
+        store_dir = os.path.abspath(self.path)
+
+        with self._locked(exclusive=True) as layout:
+            if layout.kind != "dir":
+                raise ValueError("log is not segmented; call rotate() first")
+            if archive_dir == store_dir or self._is_nested(archive_dir, store_dir):
+                raise ValueError(
+                    "archive location must be separate from the store"
+                )
+
+            units = self._view(layout)
+            # Never migrate a damaged log: the walk checks every window and
+            # chain link first.
+            states, _ = self._walk(units, layout)
+            for _count, _head, bad in states.values():
+                if bad != -1:
+                    raise ValueError("corrupt audit chain")
+
+            manifest = st.load_manifest(layout)
+            registered = manifest.get("archive")
+            if registered is not None and os.path.abspath(registered) != archive_dir:
+                raise ValueError("store is bound to a different archive location")
+
+            targets = [
+                segment
+                for segment in manifest["segments"]
+                if segment["sealed"]
+                and segment.get("location", st.LOCATION_HOT) == st.LOCATION_HOT
+            ]
+            if not targets:
+                return {"archived": 0}
+
+            os.makedirs(archive_dir, exist_ok=True)
+
+            # Register the archive binding first, with every segment still
+            # hot. From this commit the archive directory is part of the
+            # signed topology and is garbage-collected like the store, so a
+            # kill at any later point leaves orphan copies/temp files in a
+            # known, reaped location -- never unmanaged.
+            if registered is None:
+                manifest["archive"] = archive_dir
+                st.save_manifest(layout, manifest)
+                st.crash_point("archive:after_register")
+
+            unit_by_name = {unit["name"]: unit for unit in units}
+
+            # Raise the cheap in-flight sentinel so concurrent shared readers
+            # escalate to the exclusive healer instead of observing the moving
+            # topology; it carries no state (the manifest is authoritative).
+            self._write_archiving_sentinel(layout)
+            st.crash_point("archive:after_sentinel")
+
+            # Phase A: publish a verified byte copy of every selected
+            # segment in the archive while every committed segment is still
+            # hot. A kill here leaves the old topology authoritative; the
+            # unreferenced archive copies are reaped by the next writer.
+            for segment in targets:
+                name = segment["name"]
+                hot_path = unit_by_name[name]["path"]
+                self._copy_segment_to_archive(
+                    hot_path, archive_dir, name, segment["parts"]
+                )
+            st.crash_point("archive:after_copy")
+
+            # Phase B: one atomic manifest commit marks every selected
+            # segment as moving. From this commit the bytes are present in
+            # both tiers and the migration is deterministically finished (or
+            # rolled back) on the next lock acquisition, so no call is ever
+            # served the intermediate state.
+            for segment in targets:
+                segment["location"] = st.LOCATION_MOVING
+            st.save_manifest(layout, manifest)
+            st.crash_point("archive:after_manifest")
+
+            # Phase C: remove the hot-side copies; the verified archive copy
+            # is the surviving one.
+            for segment in targets:
+                with contextlib.suppress(FileNotFoundError):
+                    os.remove(layout.segment_path(segment["name"]))
+                st.crash_point("archive:during_delete_hot")
+            st.fsync_dir(layout.root)
+            st.crash_point("archive:after_delete_hot")
+
+            # Phase D: finalize residency; the topology is now hot + archive.
+            for segment in targets:
+                segment["location"] = st.LOCATION_ARCHIVE
+            st.save_manifest(layout, manifest)
+            st.crash_point("archive:after_finalize")
+
+            # The migration is durably published; retire the sentinel.
+            with contextlib.suppress(FileNotFoundError):
+                os.remove(self._archiving_sentinel(layout))
+            st.fsync_dir(layout.root)
+
+            self._relocate_cache_entries(
+                layout, archive_dir, [s["name"] for s in targets]
+            )
+        return {"archived": len(targets)}
+
+    @staticmethod
+    def _copy_segment_to_archive(
+        hot_path: str, archive_dir: str, name: str, parts: list[dict]
+    ) -> None:
+        """Publish one authenticated, byte-exact copy of a sealed segment."""
+        # The caller already proved the hot bytes match the manifest windows
+        # during its walk; copy then re-verify the published file so the
+        # commit can only ever describe two identical copies.
+        target = os.path.join(archive_dir, name)
+        tmp_path = os.path.join(archive_dir, st._tmp_name_for(name))
+        try:
+            fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            try:
+                with open(hot_path, "rb") as handle:
+                    while True:
+                        chunk = handle.read(1 << 20)
+                        if not chunk:
+                            break
+                        _write_all(fd, chunk)
+                st.crash_point("archive:before_copy_fsync")
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            st.crash_point("archive:after_copy_write")
+            os.replace(tmp_path, target)
+            st.fsync_dir(archive_dir)
+            st.crash_point("archive:after_copy_rename")
+            if not st.verify_windows(target, parts):
+                raise ValueError("corrupt audit segment")
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.remove(tmp_path)
+            raise
+
+    def _relocate_cache_entries(
+        self, layout: st.Layout, archive_dir: str, names: list[str]
+    ) -> None:
+        """Point moved units' warm cache entries at their archive stat.
+
+        The bytes are identical after the move, so each entry's fold,
+        cumulative states, record count and window material stay valid; only
+        the stat guard changes location. A repeat verify therefore keeps its
+        constant read amplification across tiers instead of cold-walking the
+        archived windows once.
+        """
+        cache = st.load_cache(layout)
+        if cache is None:
+            return
+        segments = cache["segments"]
+        changed = False
+        for name in names:
+            entry = segments.get(name)
+            if entry is None:
+                continue
+            try:
+                stat = os.stat(os.path.join(archive_dir, name))
+            except FileNotFoundError:
+                continue
+            entry["size"] = stat.st_size
+            entry["mtime_ns"] = stat.st_mtime_ns
+            entry["ctime_ns"] = stat.st_ctime_ns
+            segments[name] = entry
+            changed = True
+        if changed:
+            st.save_cache(layout, segments)
 
     # ------------------------------------------------------------------
     # Incremental verification walk
@@ -808,7 +1234,6 @@ class Chain:
         *,
         ignore_cache: bool = False,
         persist: bool = True,
-        trust_growth: bool = False,
     ) -> tuple[dict[str, tuple[int, int, int]], dict]:
         """Walk every unit in order, reusing authenticated cached prefixes.
 
@@ -877,98 +1302,61 @@ class Chain:
                 and entry.get("parts", []) == unit["parts"]
             )
             if growth:
-                # Appended-only growth on the active unit. Before the cache's
-                # cumulative states are continued, the bytes the cache was
-                # built on authenticate themselves byte for byte: a fold over
-                # every complete line up to the cached size must equal the
-                # fold stored in the (tag-authenticated) cache. A rewritten
-                # prefix -- stale digests, recomputed digests, edited bytes
-                # behind preserved manifest windows, a shifted boundary --
+                # Appended-only growth on the active unit. Any continuation --
+                # a reader verifying, or another process resuming after an
+                # append -- first proves, byte for byte, that every byte up
+                # to the cached boundary is unchanged: a fold over all
+                # complete lines through the cached size must equal the fold
+                # stored in the (tag-authenticated) cache. A rewritten prefix
+                # -- stale digests, recomputed digests, bytes edited behind
+                # preserved manifest windows, a boundary shifted mid-line --
                 # changes that fold, so the continuation is refused and the
                 # walk falls through to a complete re-derivation, whose
                 # verdict equals a full verification and whose first bad
                 # index is the real position rather than the first new line.
-                #
-                # The writer warming the cache for the line it just appended
-                # still holds the exclusive lock and the prefix is unchanged
-                # by construction, so it extends the fold over the new lines
-                # only.
-                if trust_growth:
-                    with open(path, "rb") as handle:
-                        handle.seek(entry["size"])
-                        tail_raw = handle.read()
-                    tail_lines = _split_whole_lines(tail_raw)
-                    if tail_lines is not None:
-                        candidate = {
-                            tenant: list(state) for tenant, state in states.items()
-                        }
-                        self._adopt_states(candidate, entry)
-                        before_bad = {
-                            tenant: state[2] for tenant, state in candidate.items()
-                        }
-                        tail_records = st.decode_records(b"".join(tail_lines))
-                        self._apply_records(tail_records, candidate)
-                        tail_broken = any(
-                            state[2] != before_bad.get(tenant, -1)
-                            for tenant, state in candidate.items()
-                        )
-                        new_fold = _extend_fold(entry_fold, tail_lines)
-                    else:
-                        candidate = None
-                        tail_broken = True
-                        new_fold = entry_fold
-                    if candidate is not None and not tail_broken:
+                with open(path, "rb") as handle:
+                    raw = handle.read()
+                prefix_raw = raw[: entry["size"]]
+                tail_raw = raw[entry["size"] :]
+                prefix_lines = _split_whole_lines(prefix_raw)
+                tail_lines = _split_whole_lines(tail_raw)
+                prefix_ok = (
+                    prefix_lines is not None
+                    and _fold_lines(prefix_lines) == entry_fold
+                )
+                if prefix_ok and tail_lines is not None:
+                    candidate = {
+                        tenant: list(state)
+                        for tenant, state in states.items()
+                    }
+                    self._adopt_states(candidate, entry)
+                    before_bad = {
+                        tenant: state[2] for tenant, state in candidate.items()
+                    }
+                    tail_records = st.decode_records(b"".join(tail_lines))
+                    self._apply_records(tail_records, candidate)
+                    tail_broken = any(
+                        state[2] != before_bad.get(tenant, -1)
+                        for tenant, state in candidate.items()
+                    )
+                    if not tail_broken:
                         states.clear()
                         states.update(candidate)
                         total_records = entry["records"] + len(tail_records)
-                        # Appended-only growth leaves the preserved prefix
-                        # windows untouched, so carry their material in the
-                        # cache.
+                        new_fold = _extend_fold(entry_fold, tail_lines)
                         entries[name] = _cache_entry(
-                            total_records, stat, entry.get("parts", []), states, new_fold
+                            total_records,
+                            stat,
+                            entry.get("parts", []),
+                            states,
+                            new_fold,
                         )
                         continue
-                else:
-                    with open(path, "rb") as handle:
-                        raw = handle.read()
-                    prefix_raw = raw[: entry["size"]]
-                    tail_raw = raw[entry["size"] :]
-                    prefix_lines = _split_whole_lines(prefix_raw)
-                    tail_lines = _split_whole_lines(tail_raw)
-                    prefix_ok = (
-                        prefix_lines is not None
-                        and _fold_lines(prefix_lines) == entry_fold
-                    )
-                    if prefix_ok and tail_lines is not None:
-                        candidate = {
-                            tenant: list(state)
-                            for tenant, state in states.items()
-                        }
-                        self._adopt_states(candidate, entry)
-                        before_bad = {
-                            tenant: state[2] for tenant, state in candidate.items()
-                        }
-                        tail_records = st.decode_records(b"".join(tail_lines))
-                        self._apply_records(tail_records, candidate)
-                        tail_broken = any(
-                            state[2] != before_bad.get(tenant, -1)
-                            for tenant, state in candidate.items()
-                        )
-                        if not tail_broken:
-                            states.clear()
-                            states.update(candidate)
-                            total_records = entry["records"] + len(tail_records)
-                            new_fold = _extend_fold(entry_fold, tail_lines)
-                            entries[name] = _cache_entry(
-                                total_records,
-                                stat,
-                                entry.get("parts", []),
-                                states,
-                                new_fold,
-                            )
-                            continue
-                    # Prefix authentication failed or the boundary moved:
-                    # re-derive this unit completely below.
+                    # The newly appended tail itself fails to chain: fall
+                    # through to the full walk, which pins the real bad
+                    # index on this unit.
+                # Prefix authentication failed or the boundary moved:
+                # re-derive this unit completely below.
 
             # Cold unit, shrink, same-size rewrite, any change to a sealed
             # unit, a unit following one that desynced, or a growth whose
