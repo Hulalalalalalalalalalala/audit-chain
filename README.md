@@ -48,6 +48,21 @@ Additional entry points:
 verifies an exported proof with the public digest function alone; it never
 touches the log.
 
+Two more offline entry points work purely on proof objects (no log):
+- `audit_chain.combine_proofs(left, right) -> dict` splices two proofs of the
+  same tenant whose intervals meet end-to-start (`left["end"] ==
+  right["start"]`) into one ordinary proof covering the union
+  `[left["start"], right["end"])`. It is associative, re-verifies both inputs
+  and the result, and the combined proof checks out through `verify_proof`
+  after the log itself has been compressed or deleted. A non-dict argument is
+  `TypeError`; a side that is not a valid exporting proof or does not verify,
+  or a tenant mismatch / gap / overlap / reversed order, is `ValueError`.
+- `audit_chain.verify_proofs(proofs) -> list[dict]` verifies a batch and
+  returns one verdict per proof, in input order, each with the same shape as
+  the on-chain verdict. A tampered proof yields an `ok=False` verdict with the
+  real global bad index without interrupting the rest. An empty list is
+  `ValueError`; the argument or an element that is not a dict is `TypeError`.
+
 ### Snapshot consistency
 
 `verify`, `entries` and `head` each run under a shared process lock and read
@@ -81,6 +96,26 @@ window chain using `verify_proof` (and the public digest) alone. Damage
 outside the interval cannot affect its conclusion. Empty or reversed
 intervals, non-integer or out-of-bounds ranges raise `ValueError`; a tenant
 with no history returns a verifiable empty-history proof for `(0, 0)`.
+
+Two proofs exported from the same tenant can be joined with
+`combine_proofs`: when their indices meet end-to-start the result is the same
+kind of proof over the union, independently verifiable, and associating three
+pieces pairwise gives the same conclusion as one proof over the whole range.
+This holds with endpoints on segment boundaries, across segments merged by
+compaction, and across the cross-segment window chain; it stays verifiable
+after the log is compacted, corrupted or deleted. `verify_proofs` verifies
+many proofs at once, one verdict each in order.
+
+### Export cost
+
+Exporting (and splicing, and batch verification) costs work proportional to
+the interval, not to total history length. With a warm, authenticated verify
+cache an export opens only the segment files that hold an interval record and
+reads no others; records in sealed segments are anchored straight from the
+signed manifest material, so sealed bytes are never hashed, and records in the
+still-growing tail are anchored over small windows containing only the
+interval's own lines. A never-verified or altered store transparently falls
+back to a full ordered byte scan with identical conclusions.
 
 ### Crash recovery
 

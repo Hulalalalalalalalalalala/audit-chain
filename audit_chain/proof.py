@@ -205,6 +205,160 @@ def verify_proof(
     return _verdict(p_tenant, p_start, p_end, first_bad)
 
 
+def combine_proofs(left: Any, right: Any) -> dict:
+    """Splice two contiguous proofs of the same tenant into one proof.
+
+    The interval of ``right`` must begin exactly where ``left`` ends
+    (``left["end"] == right["start"]``); the result then covers the union
+    ``[left["start"], right["end"])`` and is itself an ordinary version-1
+    proof verifiable through :func:`verify_proof`. The combined proof is
+    re-verified before it is returned, so splicing can never produce a proof
+    that does not independently check out.
+
+    A non-dict argument raises ``TypeError`` (the same rule the on-chain
+    append uses for its payload). Anything else that is not a legally
+    exported, independently verifiable proof -- a tenant mismatch, a gap, an
+    overlap, a reversed order, or a side that fails verification -- raises
+    ``ValueError`` and yields no result.
+    """
+    if not isinstance(left, dict) or not isinstance(right, dict):
+        raise TypeError("proofs must be dicts")
+
+    # Both sides must be genuine exported proofs and must independently check
+    # out before any splicing is attempted.
+    try:
+        left_verdict = verify_proof(left)
+        right_verdict = verify_proof(right)
+    except ValueError as exc:
+        raise ValueError("cannot combine: proof is not a valid range proof") from exc
+    if not left_verdict["ok"] or not right_verdict["ok"]:
+        raise ValueError("cannot combine: a proof does not independently verify")
+
+    if left["tenant"] != right["tenant"]:
+        raise ValueError("cannot combine: proofs are for different tenants")
+    if left["end"] != right["start"]:
+        # One message covers gap, overlap and reversed ordering: the only
+        # accepted relation is end-of-left exactly touching start-of-right.
+        raise ValueError("cannot combine: intervals are not contiguous")
+
+    if left["count"] == 0:
+        # The empty-history proof only touches a non-empty proof at zero;
+        # the union is then exactly the right side.
+        merged_windows = [_clone_window(window) for window in right["windows"]]
+    elif right["count"] == 0:
+        merged_windows = [_clone_window(window) for window in left["windows"]]
+    else:
+        merged_windows = [_clone_window(window) for window in left["windows"]]
+        first_right = right["windows"][0] if right["windows"] else None
+        boundary = merged_windows[-1] if merged_windows else None
+        if (
+            boundary is not None
+            and first_right is not None
+            and _same_anchor(boundary, first_right)
+        ):
+            # The split landed inside one physical byte window: keep one
+            # window and concatenate the records in index order.
+            boundary["records"].extend(_clone_slot(slot) for slot in first_right["records"])
+            rest = right["windows"][1:]
+        else:
+            rest = right["windows"]
+        merged_windows.extend(_clone_window(window) for window in rest)
+
+    # Seq numbers are local to each export, so renumber the merged chain from
+    # zero; verification only relies on them being strictly increasing.
+    for seq, window in enumerate(merged_windows):
+        window["seq"] = seq
+
+    combined = {
+        "version": PROOF_VERSION,
+        "tenant": left["tenant"],
+        "start": left["start"],
+        "end": right["end"],
+        "count": max(left["count"], right["count"]),
+        "prev": left["prev"],
+        "windows": merged_windows,
+    }
+    verdict = verify_proof(combined)
+    if not verdict["ok"]:
+        raise ValueError("cannot combine: combined proof does not verify")
+    return combined
+
+
+def verify_proofs(proofs: Any) -> list[dict]:
+    """Verify a batch of proofs, one verdict per proof, in input order.
+
+    Each verdict has exactly the shape :func:`verify_proof` returns. A proof
+    whose content was tampered with yields an ``ok=False`` verdict carrying
+    the real first bad index; verification of the remaining proofs continues.
+    A structurally malformed proof likewise yields a corrupted verdict
+    instead of interrupting the batch.
+
+    The list itself being empty raises ``ValueError``; the argument or any
+    element not being a dict raises ``TypeError``.
+    """
+    if not isinstance(proofs, list):
+        raise TypeError("proofs must be a list")
+    if not proofs:
+        raise ValueError("proofs list must not be empty")
+
+    verdicts: list[dict] = []
+    for proof in proofs:
+        if not isinstance(proof, dict):
+            raise TypeError("each proof must be a dict")
+        try:
+            verdicts.append(verify_proof(proof))
+        except ValueError:
+            # Structurally malformed: no chain walk was possible, so there is
+            # no record-derived bad index. Report corruption at the earliest
+            # index the proof itself claims, keeping the verdict shape.
+            verdicts.append(_corrupted_verdict(proof))
+    return verdicts
+
+
+def _same_anchor(a: dict, b: dict) -> bool:
+    return (
+        a["name"] == b["name"] and a["size"] == b["size"] and a["sha256"] == b["sha256"]
+    )
+
+
+def _clone_slot(slot: dict) -> dict:
+    return {
+        "index": slot["index"],
+        "offset": slot["offset"],
+        "record": dict(slot["record"]),
+    }
+
+
+def _clone_window(window: dict) -> dict:
+    return {
+        "seq": window["seq"],
+        "name": window["name"],
+        "size": window["size"],
+        "sha256": window["sha256"],
+        "records": [_clone_slot(slot) for slot in window["records"]],
+    }
+
+
+def _corrupted_verdict(proof: dict) -> dict:
+    tenant = proof.get("tenant")
+    start = proof.get("start")
+    end = proof.get("end")
+    if not isinstance(tenant, str):
+        tenant = ""
+    if not _nonneg_int(start):
+        start = 0
+    if not _nonneg_int(end) or end < start:
+        end = start
+    return {
+        "ok": False,
+        "first_bad": start,
+        "count": end - start,
+        "start": start,
+        "end": end,
+        "tenant": tenant,
+    }
+
+
 def _verdict(tenant: str, start: int, end: int, first_bad: int) -> dict:
     return {
         "ok": first_bad == -1,

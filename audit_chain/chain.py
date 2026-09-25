@@ -542,10 +542,16 @@ class Chain:
                     os.rmdir(staging)
             raise
 
-        # The sidecar cache described the former single file; its lock does
-        # not move (the lock path is topology-independent by design).
+        # The lock is topology-independent and stays put; the legacy sidecar
+        # described the former single file, whereas the store's cache lives
+        # inside the directory. Drop the stale one and warm the store's cache
+        # from the bytes just migrated (mirrors _rotate_dir), so an export
+        # right after the first rotation need not cold-scan the history.
         with contextlib.suppress(OSError):
             os.remove(layout.cache_path)
+        new_layout = st.Layout(self.path, "dir")
+        with contextlib.suppress(OSError, ValueError):
+            self._walk(self._view(new_layout), new_layout)
 
     def _rotate_dir(self, layout: st.Layout) -> None:
         units = self._view(layout)
@@ -1109,7 +1115,18 @@ class Chain:
                     return pf.empty_proof(tenant)
                 raise ValueError("range is out of bounds for an empty history")
             units = self._snapshot_units(layout, tolerate_metadata=True)
-            material = self._collect_range(units, tenant, start, end)
+            # Fast path: an authentic warm cache states each unit's
+            # cumulative tenant counts, so only units holding interval bytes
+            # are opened. With no trustworthy guide (never-verified log,
+            # grown active unit, edited bytes or metadata) fall back to the
+            # full ordered byte scan.
+            guide = self._export_guide(units, layout, tenant)
+            if guide is not None:
+                material = self._collect_range_bounded(
+                    units, tenant, start, end, guide
+                )
+            else:
+                material = self._collect_range(units, tenant, start, end)
         return pf.build_proof(material)
 
     # ------------------------------------------------------------------
@@ -1239,6 +1256,222 @@ class Chain:
                 for seq, records in sorted(buckets.items())
             ],
         }
+
+    # ------------------------------------------------------------------
+    # Bounded-export fast path (warm, authenticated verify cache)
+    # ------------------------------------------------------------------
+
+    def _export_guide(
+        self, units: list[dict], layout: st.Layout, tenant: str
+    ) -> Optional[list[int]]:
+        """Each unit's cumulative tenant record count, or None when cold.
+
+        The verify cache is signed and a unit is adopted only when the exact
+        stat guard and its preserved-window material both match, so a
+        rewritten prefix, a same-size edit, a shrunk file, a grown active
+        unit or an edited manifest window all force the full byte scan
+        instead of trusting a guide that no longer matches the bytes.
+        """
+        try:
+            cache = st.load_cache(layout)
+        except st.AuditMetadataError:
+            return None
+        if cache is None or len(cache["segments"]) != len(units):
+            return None
+
+        counts: list[int] = []
+        for unit in units:
+            entry = cache["segments"].get(unit["name"])
+            if entry is None:
+                return None
+            try:
+                stat = os.stat(unit["path"])
+            except FileNotFoundError:
+                if not unit["sealed"]:
+                    return None
+                raise
+            if not self._entry_fresh(entry, stat, unit):
+                return None
+            state = entry["tenants"].get(tenant)
+            counts.append(state[0] if state is not None else 0)
+        return counts
+
+    def _collect_range_bounded(
+        self,
+        units: list[dict],
+        tenant: str,
+        start: int,
+        end: int,
+        counts: list[int],
+    ) -> dict:
+        """Collect interval material opening only covering units.
+
+        Only the units that hold an interval record are read. A record in a
+        preserved sealed window is anchored by that window's manifest
+        material, so no sealed byte is hashed; records in the still-growing
+        un-preserved tail of an active/legacy unit are grouped into small
+        windows that contain only the interval's own consecutive lines, so
+        digest work tracks the interval rather than the unit. Total cost
+        therefore grows with the interval and the (bounded) covering units,
+        never with overall history length: non-covering units are never
+        opened and their sealed windows contribute no reads or hashes.
+        """
+        total = counts[-1]
+        if total == 0:
+            if (start, end) == (0, 0):
+                return {
+                    "tenant": tenant,
+                    "start": 0,
+                    "end": 0,
+                    "count": 0,
+                    "prev": "",
+                    "anchors": {},
+                    "buckets": [],
+                }
+            raise ValueError("range is out of bounds for an empty history")
+        if start == end:
+            raise ValueError("range must be a non-empty interval")
+        if start >= total or end > total:
+            raise ValueError("range is out of bounds")
+
+        first_unit = self._first_unit_for(counts, start)
+        last_unit = self._first_unit_for(counts, end - 1)
+
+        # Emitted windows in physical order; seqs are assigned at the end so
+        # the cross-window chain is strictly increasing.
+        emitted: list[dict] = []
+        sealed_index: dict[tuple[int, int], int] = {}
+        predecessor: Optional[str] = None
+
+        for ui in range(first_unit, last_unit + 1):
+            unit = units[ui]
+            with open(unit["path"], "rb") as handle:
+                raw = handle.read()
+
+            parts = unit["parts"]
+            window_ends: list[int] = []
+            running = 0
+            for part in parts:
+                running += part["size"]
+                window_ends.append(running)
+            tail_offset = running
+
+            # Pending narrowed tail window: [blob, slots]. It holds one run
+            # of physically consecutive interval lines, so its bytes contain
+            # only interval records -- no other-tenant or out-of-range line.
+            run: Optional[list] = None
+            prev_tail_end: Optional[int] = None
+            base = counts[ui - 1] if ui else 0
+            local = base
+            pos = 0
+
+            def flush_tail() -> None:
+                nonlocal run
+                if not run:
+                    run = None
+                    return
+                blob, slots = run
+                emitted.append(
+                    {
+                        "name": unit["name"],
+                        "size": len(blob),
+                        "sha256": _sha256(blob),
+                        "records": slots,
+                    }
+                )
+                run = None
+
+            for line_raw in raw.split(b"\n")[:-1]:
+                line_start = pos
+                line = line_raw + b"\n"
+                pos += len(line)
+                try:
+                    record = st.decode_records(line)[0]
+                except ValueError:
+                    record = None
+                is_tenant = record is not None and record["tenant"] == tenant
+                included = is_tenant and start <= local < end
+
+                if is_tenant and local == start:
+                    predecessor = record["prev"]
+
+                if included:
+                    win_index = 0
+                    while (
+                        win_index < len(window_ends)
+                        and line_start >= window_ends[win_index]
+                    ):
+                        win_index += 1
+                    if win_index < len(window_ends):
+                        # Preserved sealed window: reuse the manifest anchor.
+                        flush_tail()
+                        prev_tail_end = line_start + len(line)
+                        window_start = window_ends[win_index - 1] if win_index else 0
+                        key = (ui, win_index)
+                        slot_pos = sealed_index.get(key)
+                        if slot_pos is None:
+                            part = parts[win_index]
+                            slot_pos = len(emitted)
+                            sealed_index[key] = slot_pos
+                            emitted.append(
+                                {
+                                    "name": part["name"],
+                                    "size": part["size"],
+                                    "sha256": part["sha256"],
+                                    "records": [],
+                                }
+                            )
+                        emitted[slot_pos]["records"].append(
+                            (local, line_start - window_start, record)
+                        )
+                    else:
+                        # Growing tail: consecutive interval lines share one
+                        # small window; any intervening physical line (another
+                        # tenant, an out-of-range record, a bad line) splits it.
+                        if run is None or line_start != prev_tail_end:
+                            flush_tail()
+                            run = [b"", []]
+                        offset_in_run = len(run[0])
+                        run[0] += line
+                        run[1].append((local, offset_in_run, record))
+                        prev_tail_end = line_start + len(line)
+                else:
+                    flush_tail()
+                    prev_tail_end = None
+
+                if is_tenant:
+                    local += 1
+
+            flush_tail()
+
+        anchors = {
+            seq: {
+                "name": window["name"],
+                "size": window["size"],
+                "sha256": window["sha256"],
+            }
+            for seq, window in enumerate(emitted)
+        }
+        return {
+            "tenant": tenant,
+            "start": start,
+            "end": end,
+            "count": total,
+            "prev": predecessor if predecessor is not None else "",
+            "anchors": anchors,
+            "buckets": [
+                {"seq": seq, "records": window["records"]}
+                for seq, window in enumerate(emitted)
+            ],
+        }
+
+    @staticmethod
+    def _first_unit_for(counts: list[int], index: int) -> int:
+        """First unit whose cumulative tenant count is greater than ``index``."""
+        for ui, cumulative in enumerate(counts):
+            if cumulative > index:
+                return ui
+        return len(counts) - 1
 
     def _delete_cache(self, layout: st.Layout) -> None:
         with contextlib.suppress(FileNotFoundError):

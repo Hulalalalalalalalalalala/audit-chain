@@ -8,6 +8,6 @@ independent: an entry only links to the previous entry of the same tenant.
 from __future__ import annotations
 
 from .chain import Chain
-from .proof import verify_proof
+from .proof import combine_proofs, verify_proof, verify_proofs
 
-__all__ = ["Chain", "verify_proof"]
+__all__ = ["Chain", "combine_proofs", "verify_proof", "verify_proofs"]
