@@ -205,6 +205,22 @@ def verify_proof(
     return _verdict(p_tenant, p_start, p_end, first_bad)
 
 
+def extend_proof(proof: Any, path: str) -> dict:
+    """Continue an exported range proof onto the log's current prefix.
+
+    ``proof`` is a proof previously exported from the log at ``path`` (or
+    spliced from such proofs); the result covers ``[proof["start"], N)``
+    where ``N`` is the tenant's record count at read time and is itself an
+    ordinary version-1 proof verifiable through :func:`verify_proof`. Only
+    records past the proof's end are read from the store, so the cost
+    tracks the increment, not the total history length. See
+    :meth:`audit_chain.chain.Chain.extend_proof` for the full contract.
+    """
+    from .chain import Chain
+
+    return Chain(path).extend_proof(proof)
+
+
 def combine_proofs(left: Any, right: Any) -> dict:
     """Splice two contiguous proofs of the same tenant into one proof.
 

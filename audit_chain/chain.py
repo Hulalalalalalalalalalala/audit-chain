@@ -36,6 +36,9 @@ semantics:
 * ``export_range`` produces an offline proof for a contiguous index
   interval: only the interval's records plus the window anchors needed to
   attach the chain, verifiable with the public digest alone;
+* ``extend_proof`` continues such an exported proof onto the current
+  history prefix, reading only the records past the proof's end, so the
+  cost tracks the increment rather than the total history length;
 * ``recover`` is the explicit entry point that truncates a half-written
   tail line left by a killed process.
 """
@@ -43,6 +46,7 @@ semantics:
 from __future__ import annotations
 
 import contextlib
+import copy
 import hashlib
 import os
 from typing import Any, Optional
@@ -1466,6 +1470,113 @@ class Chain:
             else:
                 material = self._collect_range(units, tenant, start, end)
         return pf.build_proof(material)
+
+    def extend_proof(self, proof: Any) -> dict:
+        """Continue an exported range proof onto the current history prefix.
+
+        ``proof`` is a proof previously produced by :meth:`export_range`
+        (or spliced from such proofs). The result is an ordinary version-1
+        proof -- the same shape :meth:`export_range` returns -- covering
+        ``[proof["start"], N)`` where ``N`` is the tenant's record count at
+        the moment of the read, verifiable through
+        :func:`audit_chain.proof.verify_proof` like any exported proof.
+
+        Only records past ``proof["end"]`` are read from the store: the
+        tenant's current count and head come from the same incremental
+        walk ``verify`` uses (a warm, authenticated cache is adopted with
+        no record reads at all) and the increment is collected through the
+        bounded export path, so reads, digest work and memory track the
+        increment, never the total history length. A never-verified or
+        altered store transparently falls back to one ordered scan with
+        identical conclusions. The whole read runs under the shared lock
+        on one fixed unit list, so a concurrent append, rotation,
+        compaction or archive migration yields the proof of exactly one
+        complete prefix -- never a mixed topology. The result still
+        carries only the covered interval's chained records plus the
+        window anchors needed to attach them; no out-of-interval payload
+        is included.
+
+        When the history has no records past the proof's end the returned
+        proof is equivalent to the input and its offline verdict is
+        unchanged. A non-dict proof raises ``TypeError``. A malformed,
+        reversed or non-verifying proof raises ``ValueError``, as does a
+        proof whose end lies beyond the intact prefix (a shortened,
+        rewritten or corrupt history) or one whose terminal digest the
+        current chain does not descend from. A missing log raises
+        ``FileNotFoundError``. The store is never written: like
+        :meth:`export_range` the extension only reads, so an interrupted
+        extension leaves no temporary files or half-written state behind
+        and re-extending is unaffected.
+        """
+        from . import proof as pf
+
+        if not isinstance(proof, dict):
+            raise TypeError("proof must be a dict")
+        # The input must be a genuine, independently verifiable exported
+        # proof before any continuation is attempted.
+        try:
+            verdict = pf.verify_proof(proof)
+        except ValueError as exc:
+            raise ValueError(
+                "cannot extend: proof is not a valid range proof"
+            ) from exc
+        if not verdict["ok"]:
+            raise ValueError("cannot extend: proof does not independently verify")
+
+        tenant = proof["tenant"]
+        end = proof["end"]
+        # The digest the verified interval chains up to: the first record
+        # after the proof's end must link from exactly this digest.
+        terminal = proof["prev"]
+        for window in proof["windows"]:
+            for item in window["records"]:
+                terminal = item["record"]["digest"]
+
+        with self._locked(exclusive=False) as layout:
+            self._require_present(layout)
+            units = self._snapshot_units(layout, tolerate_metadata=True)
+            # Read-only like export_range: the walk may adopt a warm,
+            # authenticated cache but never persists one, so an interrupted
+            # extension cannot leave a half-written sidecar behind.
+            try:
+                states, _ = self._walk(units, layout, persist=False)
+            except st.AuditMetadataError:
+                # Tampered metadata cannot vouch for anything: re-derive
+                # from the bytes themselves, exactly as verify() does.
+                states, _ = self._walk(units, layout, ignore_cache=True, persist=False)
+
+            state = states.get(tenant)
+            count, head, bad = state if state is not None else (0, "", -1)
+            if bad != -1:
+                raise ValueError("corrupt audit chain")
+            if end > count:
+                raise ValueError(
+                    "cannot extend: proof end is beyond the intact prefix"
+                )
+
+            if count == end:
+                # No new records: the input already covers the full prefix.
+                # It is only equivalent to the current history when the
+                # re-derived chain ends on the proof's own terminal digest.
+                if head != terminal:
+                    raise ValueError(
+                        "cannot extend: proof does not match the current history"
+                    )
+                return copy.deepcopy(proof)
+
+            guide = self._export_guide(units, layout, tenant)
+            if guide is not None:
+                material = self._collect_range_bounded(
+                    units, tenant, end, count, guide
+                )
+            else:
+                material = self._collect_range(units, tenant, end, count)
+            increment = pf.build_proof(material)
+
+        # Splice offline: the increment's first record must link from the
+        # proof's terminal digest, so a history rewritten behind the proof
+        # fails here even when its chain still re-derives.
+        return pf.combine_proofs(proof, increment)
 
     # ------------------------------------------------------------------
     # Small helpers

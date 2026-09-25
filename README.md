@@ -69,6 +69,16 @@ Two more offline entry points work purely on proof objects (no log):
   the on-chain verdict. A tampered proof yields an `ok=False` verdict with the
   real global bad index without interrupting the rest. An empty list is
   `ValueError`; the argument or an element that is not a dict is `TypeError`.
+- `audit_chain.extend_proof(proof, path) -> dict` continues an exported
+  proof onto the log's current prefix: the result is an ordinary proof
+  covering `[proof["start"], N)` where `N` is the tenant's record count at
+  read time. Only records past the proof's end are read, so the cost tracks
+  the increment, not the history length; with no new records the returned
+  proof is equivalent to the input. Also available as
+  `Chain(path).extend_proof(proof)`. A non-dict proof is `TypeError`; a
+  malformed, reversed or non-verifying proof, a proof whose end lies beyond
+  the intact prefix, or a corrupt chain is `ValueError`; a missing log is
+  `FileNotFoundError`.
 
 ### Online archiving
 
@@ -132,6 +142,18 @@ This holds with endpoints on segment boundaries, across segments merged by
 compaction, and across the cross-segment window chain; it stays verifiable
 after the log is compacted, corrupted or deleted. `verify_proofs` verifies
 many proofs at once, one verdict each in order.
+
+`extend_proof(proof, path)` (or `chain.extend_proof(proof)`) continues an
+exported proof incrementally: it reads only the records appended past the
+proof's end — never re-reading the covered prefix — and returns an ordinary
+proof covering the interval up to the complete prefix at read time. The read
+runs under the same shared snapshot lock as the other queries, so a
+concurrent append, rotation, compaction or archive migration yields exactly
+one complete prefix, never a mixed topology. With nothing new the result is
+equivalent to the input and its offline verdict is unchanged. Extension is
+read-only — like `export_range` it never writes to the store — so an
+interrupted extension leaves no temporary files or half-written state and
+re-extending is unaffected.
 
 ### Export cost
 
