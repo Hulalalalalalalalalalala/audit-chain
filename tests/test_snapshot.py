@@ -81,3 +81,38 @@ class SnapshotConsistencyTest(AuditTestCase):
             [e["payload"]["i"] for e in self.chain.entries("t")],
             list(range(final["count"])),
         )
+
+    def test_exports_always_cover_a_complete_prefix(self) -> None:
+        from audit_chain import verify_proof
+
+        ctx = multiprocessing.get_context("fork")
+        ready = ctx.Queue()
+        writer = ctx.Process(target=_writer, args=(self.path, 4.0, ready))
+        writer.start()
+        self.assertTrue(ready.get(timeout=30))
+
+        ticks = 0
+        while writer.is_alive() and ticks < 500:
+            # A writer may commit between verify and export, so the count is
+            # only a lower bound; the proof itself must be one prefix.
+            count = self.chain.verify("t")["count"]
+            if count < 2:
+                continue
+            proof = self.chain.export_range("t", 0, count)
+            # The export is append-only consistent: the tenant total it
+            # reports is at least the count observed moments before, and
+            # the interval records are exactly payloads 0..count-1 -- no
+            # mixed pre/post-merge halves, no duplicated or skipped run.
+            self.assertGreaterEqual(proof["count"], count)
+            payloads = [
+                window_record["record"]["payload"]["i"]
+                for window in proof["windows"]
+                for window_record in window["records"]
+            ]
+            self.assertEqual(payloads, list(range(count)))
+            self.assertTrue(verify_proof(proof, tenant="t")["ok"])
+            ticks += 1
+
+        writer.join(timeout=30)
+        self.assertEqual(writer.exitcode, 0)
+        self.assertGreater(ticks, 5)

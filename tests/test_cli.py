@@ -168,8 +168,9 @@ class CliTest(AuditTestCase):
         )
         self.assertEqual(code, 0, err)
         self.assertEqual(err, "")
-        verdict = json.loads(out)
-        self.assertTrue(verdict["ok"])
+        # Success is exactly one compact line: the three chain-verdict keys,
+        # sorted, no extra whitespace, one trailing newline.
+        self.assertEqual(out, '{"count":6,"first_bad":-1,"ok":true}\n')
 
     def test_export_illegal_range_is_silent_exit_2(self) -> None:
         self.append_many("t", 3)
@@ -180,7 +181,7 @@ class CliTest(AuditTestCase):
         self.assertEqual(out, "")
         self.assertEqual(err, "")
 
-    def test_verify_proof_failure_is_exit_1(self) -> None:
+    def test_verify_proof_failure_is_silent_exit_1(self) -> None:
         self.append_many("t", 5)
         code, out, _ = self.run_cli(
             "--path", self.path, "export", "t", "--start", "0", "--end", "5"
@@ -192,8 +193,10 @@ class CliTest(AuditTestCase):
             json.dump(proof, handle)
         code, out, err = self.run_cli("verify-proof", proof_path)
         self.assertEqual(code, 1)
+        # A broken proof is reported by the exit code alone: nothing is
+        # written on either stream.
+        self.assertEqual(out, "")
         self.assertEqual(err, "")
-        self.assertFalse(json.loads(out)["ok"])
 
     def test_verify_proof_malformed_file_is_exit_2(self) -> None:
         proof_path = os.path.join(self._tmp, "malformed.json")

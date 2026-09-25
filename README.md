@@ -27,7 +27,11 @@ same path. Exit codes: `0` success, `1` verification found a broken entry
 (including a tampered cache, manifest or sealed window), `2` any other error
 (missing file, bad/half-written line, corrupt chain, bad payload type,
 illegal proof range, lock contention, path/permission errors). Error paths
-print nothing. `verify-proof` never opens the log.
+print nothing. `verify-proof` never opens the log and keeps its output to
+the success case: exactly one compact JSON line with the keys `ok`,
+`first_bad` and `count` (sorted, no extra whitespace, one trailing
+newline). A broken proof exits `1` silently; any other failure exits `2`
+silently.
 
 ## Public interface
 

@@ -14,7 +14,11 @@ verification finds a broken entry. Missing files, bad lines, chain
 corruption, payload type errors, illegal proof ranges, lock contention and
 other system errors (e.g. a path that is a directory or is not writable)
 exit 2. No tracebacks or explanatory text are emitted on those paths.
-``verify-proof`` is fully offline: it never opens the log.
+``verify-proof`` is fully offline: it never opens the log, and it keeps its
+output to the success case alone -- exactly one compact JSON line with the
+keys ``ok``, ``first_bad`` and ``count``. A broken proof exits 1 silently
+and every other failure exits 2 silently; neither failure path writes
+anything.
 """
 
 from __future__ import annotations
@@ -107,10 +111,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 start=args.start,
                 end=args.end,
             )
-            sys.stdout.write(_compact(result) + "\n")
-            return 0 if result["ok"] else 1
         except (OSError, ValueError, TypeError):
             return 2
+        if not result["ok"]:
+            # A broken proof is signalled by the exit code alone.
+            return 1
+        # Success writes exactly one compact line: the chain-verdict keys
+        # ok / first_bad / count, sorted, no extra whitespace.
+        sys.stdout.write(
+            _compact(
+                {
+                    "ok": result["ok"],
+                    "first_bad": result["first_bad"],
+                    "count": result["count"],
+                }
+            )
+            + "\n"
+        )
+        return 0
 
     if not args.path:
         return 2
