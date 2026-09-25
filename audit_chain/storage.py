@@ -9,6 +9,11 @@ Two on-disk layouts are supported:
   pre-extension log wrote it. Its verify cache lives next to it as a
   dotfile; ``rotate()`` migrates the file itself into a segment store.
 
+A segment store is optionally two-tiered: the manifest records an archive
+directory (the cold tier) and flags the sealed segments that were migrated
+there, so every reader resolves a segment's bytes to exactly one of the
+two locations.
+
 The lock file is a sibling dotfile (``.<name>.lock``) for *both* layouts, so
 migrating a file into a segment store never changes the lock path and a
 migration in progress stays mutually exclusive with readers. Locking uses
@@ -387,13 +392,16 @@ def default_manifest(first: str) -> dict:
 
 
 def _manifest_payload_text(manifest: dict) -> str:
-    return rec.canonical_json(
-        {
-            "version": manifest["version"],
-            "active": manifest["active"],
-            "segments": manifest["segments"],
-        }
-    )
+    body = {
+        "version": manifest["version"],
+        "active": manifest["active"],
+        "segments": manifest["segments"],
+    }
+    # The archive location is part of the signed body only when present, so
+    # manifests written before two-tier storage existed keep their tags.
+    if manifest.get("archive") is not None:
+        body["archive"] = manifest["archive"]
+    return rec.canonical_json(body)
 
 
 def sign_manifest(manifest: dict) -> dict:
@@ -403,6 +411,8 @@ def sign_manifest(manifest: dict) -> dict:
         "active": manifest["active"],
         "segments": manifest["segments"],
     }
+    if manifest.get("archive") is not None:
+        signed["archive"] = manifest["archive"]
     signed["tag"] = hashlib.sha256(
         _manifest_payload_text(signed).encode(_ENCODING)
     ).hexdigest()
@@ -440,6 +450,9 @@ def _valid_manifest(manifest: Any) -> bool:
         return False
     if manifest.get("version") != 1 or not isinstance(manifest.get("active"), str):
         return False
+    archive = manifest.get("archive")
+    if archive is not None and not isinstance(archive, str):
+        return False
     segments = manifest.get("segments")
     if not isinstance(segments, list) or not segments:
         return False
@@ -450,6 +463,16 @@ def _valid_manifest(manifest: Any) -> bool:
             segment.get("sealed"), bool
         ):
             return False
+        archived = segment.get("archived", False)
+        if not isinstance(archived, bool):
+            return False
+        if archived:
+            # An archived segment lives in the recorded archive location; it
+            # is always sealed and never the active segment.
+            if not archive or not segment["sealed"]:
+                return False
+            if segment["name"] == manifest["active"]:
+                return False
         parts = segment.get("parts")
         if not isinstance(parts, list):
             return False

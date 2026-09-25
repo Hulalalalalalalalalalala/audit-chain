@@ -17,6 +17,7 @@ Python 3.11 or newer. Standard library only.
     python3 -m audit_chain --path ./audit recover
     python3 -m audit_chain --path ./audit rotate
     python3 -m audit_chain --path ./audit compact [--max-segments N]
+    python3 -m audit_chain --path ./audit archive <archive-dir>
     python3 -m audit_chain --path ./audit export <tenant> --start N --end M > proof.json
     python3 -m audit_chain verify-proof proof.json [--tenant T] [--start N] [--end M]
 
@@ -43,6 +44,8 @@ Additional entry points:
   left by a killed process; complete but broken records are never repaired.
 - `rotate()` seals the active segment and starts a new one.
 - `compact(max_segments=2) -> {"segments": n}` merges old segments.
+- `archive(archive_dir) -> {"archived": n}` migrates every sealed segment
+  to the caller-specified archive directory, online.
 
 `audit_chain.verify_proof(proof, *, tenant=None, start=None, end=None)`
 verifies an exported proof with the public digest function alone; it never
@@ -62,6 +65,26 @@ Two more offline entry points work purely on proof objects (no log):
   the on-chain verdict. A tampered proof yields an `ok=False` verdict with the
   real global bad index without interrupting the rest. An empty list is
   `ValueError`; the argument or an element that is not a dict is `TypeError`.
+
+### Online archiving
+
+`archive(archive_dir)` moves every sealed segment out of the hot store
+into the caller-specified archive directory while the log stays online.
+The self-authenticating manifest records the archive location and keeps
+each migrated segment's byte-window material, so later opens need no
+extra arguments: append, query, verify, rotate, compact, recover and
+export all work unchanged across the hot and archive tiers, per-tenant
+indices stay continuous from zero, rotation order is untouched, and a
+post-archive verify reports exactly the first bad index a pre-archive
+verify would. Migrated segments no longer occupy the hot directory. The
+migration is serialized with appends and merges by the same lock, so a
+concurrent reader always sees one complete prefix and a writer is never
+starved out; a process killed mid-migration reopens onto either the
+pre-archive or the complete post-archive topology -- staged copies,
+orphans and hot duplicates are reaped deterministically, and no segment
+is ever half moved or left in both tiers. Archiving a damaged log, a
+legacy unsegmented file, or a location that conflicts with the recorded
+one raises `ValueError`.
 
 ### Snapshot consistency
 

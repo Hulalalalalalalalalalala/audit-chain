@@ -17,11 +17,11 @@ from audit_chain import Chain  # noqa: E402
 
 def main() -> None:
     path, operation, crash_point = sys.argv[1], sys.argv[2], sys.argv[3]
-    index = int(sys.argv[4]) if len(sys.argv) > 4 else 0
     if crash_point:
         os.environ["AUDIT_CHAIN_CRASH"] = crash_point
     chain = Chain(path)
     if operation == "append":
+        index = int(sys.argv[4]) if len(sys.argv) > 4 else 0
         chain.append("t", {"i": index})
     elif operation == "migrate":
         chain.rotate()
@@ -29,6 +29,9 @@ def main() -> None:
         chain.rotate()
     elif operation == "compact":
         chain.compact(2)
+    elif operation == "archive":
+        # argv[4] carries the archive directory for this operation.
+        chain.archive(sys.argv[4] if len(sys.argv) > 4 else path + ".archive")
     elif operation == "recover":
         chain.recover()
     else:  # pragma: no cover - test harness error
