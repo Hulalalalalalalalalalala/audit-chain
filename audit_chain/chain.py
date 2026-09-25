@@ -57,6 +57,12 @@ _DEFAULT_MAX_SEGMENTS = 2
 # Present in the store directory while an archive migration is in flight;
 # left behind only by a killed migration and cleared by the next healer.
 _ARCHIVE_MARKER = ".archiving"
+# os.open() on Windows falls back to the CRT text mode when no translation
+# flag is given, rewriting every "\n" as "\r\n" on write. The log's byte
+# format is fixed (canonical JSON lines terminated by a single "\n"), so
+# every file descriptor that carries log bytes is opened explicitly binary.
+# os.O_BINARY does not exist on POSIX, where the flag is simply 0.
+_O_BINARY = getattr(os, "O_BINARY", 0)
 
 
 class Chain:
@@ -427,7 +433,9 @@ class Chain:
             # leaves a deterministic half line that reopen treats as a bad
             # line, never as a silently repaired record.
             cut = max(1, len(data) // 2)
-            fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+            fd = os.open(
+                target, os.O_WRONLY | os.O_CREAT | os.O_APPEND | _O_BINARY, 0o600
+            )
             try:
                 _write_all(fd, data[:cut])
                 st.crash_point("append:after_first_write")
@@ -514,7 +522,7 @@ class Chain:
             # cached deletion (either the half line still reads as a bad
             # line, or the cache is already gone and the prefix re-derives).
             self._delete_cache(layout)
-            fd = os.open(target, os.O_WRONLY)
+            fd = os.open(target, os.O_WRONLY | _O_BINARY)
             try:
                 os.ftruncate(fd, cut)
                 st.crash_point("recover:after_truncate")
@@ -946,7 +954,9 @@ class Chain:
         target = os.path.join(directory, name)
         tmp_path = os.path.join(directory, st._tmp_name_for(name))
         try:
-            fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            fd = os.open(
+                tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | _O_BINARY, 0o600
+            )
             try:
                 _write_all(fd, raw)
                 st.crash_point(f"{phase}:before_{kind}_fsync")
