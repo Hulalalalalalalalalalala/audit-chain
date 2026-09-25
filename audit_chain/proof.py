@@ -21,10 +21,18 @@ the predecessor links are checked, the indices are checked to be exactly
 windows, and the window sequence is checked to be strictly increasing.
 Damage outside the interval cannot affect this conclusion because no
 out-of-interval byte participates in the check.
+
+Two proofs exported for one tenant can be joined with
+:func:`combine_proofs` when their intervals touch: the result is again an
+ordinary proof of the union interval, verifiable by :func:`verify_proof`
+alone. :func:`verify_proofs` checks a whole batch in one call, returning
+one verdict per proof in the caller's order, each shaped like the on-chain
+verify result.
 """
 
 from __future__ import annotations
 
+import copy
 import re
 from typing import Any, Optional
 
@@ -203,6 +211,113 @@ def verify_proof(
     if expected_index != p_end:
         flag(p_end)
     return _verdict(p_tenant, p_start, p_end, first_bad)
+
+
+def combine_proofs(left: Any, right: Any) -> dict:
+    """Join two adjacent proofs of one tenant into their union proof.
+
+    Both sides must be genuine, independently verifiable proofs (as produced
+    by ``export_range``) with ``left.end == right.start``; the combined
+    proof covers ``[left.start, right.end)`` and verifies with
+    :func:`verify_proof` alone, exactly like a direct export of the union
+    interval. Combination is deterministic and associative: joining three
+    adjacent proofs in either grouping yields the same proof.
+
+    Raises ``TypeError`` when either argument is not a dict (the same
+    convention as ``Chain.append``), and ``ValueError`` when a side is
+    malformed or does not verify on its own, when the tenants differ, when
+    the intervals overlap, leave a gap or run in reverse, or when the two
+    sides cannot form one consistent, verifiable proof.
+    """
+    if not isinstance(left, dict) or not isinstance(right, dict):
+        raise TypeError("proofs must be dicts")
+    for side in (left, right):
+        if not verify_proof(side)["ok"]:
+            raise ValueError("proof does not verify on its own")
+    if left["tenant"] != right["tenant"]:
+        raise ValueError("proofs are for different tenants")
+    if left["end"] != right["start"]:
+        raise ValueError("proof intervals are not adjacent")
+
+    left_windows = copy.deepcopy(left["windows"])
+    right_windows = copy.deepcopy(right["windows"])
+    if left["count"] and right["count"]:
+        # The chain link across the junction must hold, or the combined
+        # proof could never verify on its own.
+        last_digest = left_windows[-1]["records"][-1]["record"]["digest"]
+        _require(right["prev"] == last_digest, "proofs do not chain")
+    if left_windows and right_windows:
+        tail = left_windows[-1]
+        head = right_windows[0]
+        if tail["seq"] == head["seq"]:
+            # The interval boundary sits inside one shared byte window:
+            # merge the two record runs into that window's anchor.
+            for key in ("name", "size", "sha256"):
+                _require(tail[key] == head[key], "conflicting window anchors")
+            _require(
+                tail["records"][-1]["offset"] < head["records"][0]["offset"],
+                "window records do not chain",
+            )
+            tail["records"].extend(head["records"])
+            right_windows = right_windows[1:]
+        else:
+            # The joined window list must stay strictly increasing.
+            _require(tail["seq"] < head["seq"], "incompatible window chains")
+
+    return {
+        "version": PROOF_VERSION,
+        "tenant": left["tenant"],
+        "start": left["start"],
+        "end": right["end"],
+        "count": max(left["count"], right["count"]),
+        "prev": left["prev"],
+        "windows": left_windows + right_windows,
+    }
+
+
+def verify_proofs(proofs: Any) -> list[dict]:
+    """Verify a batch of range proofs: one verdict per proof, in order.
+
+    Each verdict is shaped like the on-chain verify result --
+    ``{"count": n, "first_bad": i, "ok": bool}`` -- where ``count`` is the
+    number of records the proof covers and ``first_bad`` the global tenant
+    index of the first broken record. One tampered proof never aborts the
+    batch: its verdict reports the corruption with the real bad index and
+    the remaining proofs are still checked. An empty list raises
+    ``ValueError``; a non-dict element raises ``TypeError``.
+    """
+    if not isinstance(proofs, list):
+        raise TypeError("proofs must be a list")
+    if not proofs:
+        raise ValueError("no proofs to verify")
+    verdicts = []
+    for proof in proofs:
+        if not isinstance(proof, dict):
+            raise TypeError("proof must be a dict")
+        try:
+            verdict = verify_proof(proof)
+        except ValueError:
+            verdicts.append(_corrupt_verdict(proof))
+            continue
+        verdicts.append(
+            {
+                "count": verdict["count"],
+                "first_bad": verdict["first_bad"],
+                "ok": verdict["ok"],
+            }
+        )
+    return verdicts
+
+
+def _corrupt_verdict(proof: dict) -> dict:
+    """Corruption verdict for a proof too malformed to verify at all."""
+    start = proof.get("start")
+    end = proof.get("end")
+    if not _nonneg_int(start):
+        start = 0
+    if not _nonneg_int(end) or end < start:
+        end = start
+    return {"count": end - start, "first_bad": start, "ok": False}
 
 
 def _verdict(tenant: str, start: int, end: int, first_bad: int) -> dict:

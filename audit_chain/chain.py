@@ -1080,7 +1080,9 @@ class Chain:
         attach the interval to the prefix and confirm it is contiguous. No
         payload outside the interval is included. An independent reader can
         check it with :func:`audit_chain.proof.verify_proof` and the public
-        digest function alone.
+        digest function alone. Export reads and hashes in proportion to the
+        interval, not the history: units that cannot hold an interval
+        record are skipped off the authenticated verify cache's metadata.
 
         Illegal, reversed, empty or out-of-range intervals raise
         ``ValueError``; for a tenant with no history the empty-history
@@ -1109,7 +1111,7 @@ class Chain:
                     return pf.empty_proof(tenant)
                 raise ValueError("range is out of bounds for an empty history")
             units = self._snapshot_units(layout, tolerate_metadata=True)
-            material = self._collect_range(units, tenant, start, end)
+            material = self._collect_range(units, layout, tenant, start, end)
         return pf.build_proof(material)
 
     # ------------------------------------------------------------------
@@ -1124,8 +1126,54 @@ class Chain:
             os.fsync(handle.fileno())
         st.fsync_dir(directory)
 
+    def _cached_unit_ranges(
+        self, units: list[dict], layout: st.Layout, tenant: str
+    ) -> Optional[list[tuple[int, int, int]]]:
+        """Per-unit tenant index spans from the authenticated verify cache.
+
+        Returns ``[(lo, hi, size), ...]`` -- the tenant's cumulative global
+        index span covered by each unit plus the unit's byte size -- when
+        every unit's cache entry is present and fresh, else ``None`` (the
+        caller then falls back to a full scan). Reads only sidecar metadata
+        and file stats, never a log byte. The freshness guard is the same
+        one the verify hot path trusts (stat identity plus the manifest's
+        window material), so spans adopted here are exactly what a full
+        scan would recount.
+        """
+        try:
+            cache = st.load_cache(layout)
+        except st.AuditMetadataError:
+            return None
+        if cache is None:
+            return None
+        cached = cache["segments"]
+        ranges: list[tuple[int, int, int]] = []
+        running = 0
+        for unit in units:
+            entry = cached.get(unit["name"])
+            try:
+                stat = os.stat(unit["path"])
+            except OSError:
+                return None
+            if entry is None:
+                # A rotate leaves the fresh active segment uncached until
+                # the next write warms it. An empty, unsealed unit with no
+                # preserved windows is deterministic without the cache: it
+                # holds no records and one implicit zero-length window.
+                if unit["sealed"] or unit["parts"] or stat.st_size != 0:
+                    return None
+                ranges.append((running, running, 0))
+                continue
+            if not self._entry_fresh(entry, stat, unit):
+                return None
+            state = entry["tenants"].get(tenant)
+            hi = state[0] if state is not None else running
+            ranges.append((running, hi, stat.st_size))
+            running = hi
+        return ranges
+
     def _collect_range(
-        self, units: list[dict], tenant: str, start: int, end: int
+        self, units: list[dict], layout: st.Layout, tenant: str, start: int, end: int
     ) -> dict:
         """One ordered snapshot scan collecting interval material.
 
@@ -1134,14 +1182,56 @@ class Chain:
         window chain. Only records of ``tenant`` are parsed; malformed lines
         and a trailing half line outside the interval are skipped, so damage
         outside the interval cannot change its conclusion.
+
+        The cost is proportional to the interval, not the history: when the
+        authenticated verify cache is fresh for every unit, the tenant's
+        per-unit index spans are known from sidecar metadata alone, so units
+        that cannot hold an interval record are never opened and no window
+        hash is computed for them; window anchors are only hashed when an
+        interval record actually lives in them. Without a usable cache the
+        scan falls back to reading every unit, exactly as before, and the
+        emitted proof is identical either way.
         """
+        ranges = self._cached_unit_ranges(units, layout, tenant)
+        if ranges is not None:
+            total = ranges[-1][1] if ranges else 0
+            if total == 0:
+                if (start, end) == (0, 0):
+                    return _empty_material(tenant)
+                raise ValueError("range is out of bounds for an empty history")
+            if start == end:
+                raise ValueError("range must be a non-empty interval")
+            if start >= total or end > total:
+                raise ValueError("range is out of bounds")
+
         buckets: dict[int, list[tuple[int, int, dict]]] = {}
         anchors: dict[int, dict] = {}
         predecessor: Optional[str] = None
         count = 0
         global_seq = 0
 
-        for unit in units:
+        for unit_index, unit in enumerate(units):
+            parts = unit["parts"]
+            window_ends: list[int] = []
+            running = 0
+            for part in parts:
+                running += part["size"]
+                window_ends.append(running)
+            tail_offset = running
+
+            if ranges is not None:
+                lo, hi, size = ranges[unit_index]
+                if hi <= start or lo >= end:
+                    # No interval record can live in this unit: skip the
+                    # read and all digest work, advancing the global window
+                    # sequence by the unit's window count, which metadata
+                    # and the file size determine without opening the file.
+                    global_seq += len(parts) + (
+                        1 if size > tail_offset or not parts else 0
+                    )
+                    continue
+                count = lo
+
             try:
                 with open(unit["path"], "rb") as handle:
                     raw = handle.read()
@@ -1150,33 +1240,7 @@ class Chain:
                     continue
                 raise
 
-            parts = unit["parts"]
-            window_ends: list[int] = []
-            running = 0
-            for part in parts:
-                running += part["size"]
-                window_ends.append(running)
-                anchors[global_seq + len(window_ends) - 1] = {
-                    "name": part["name"],
-                    "size": part["size"],
-                    "sha256": part["sha256"],
-                }
-            tail_offset = running
             tail_seq = global_seq + len(parts)
-            if len(raw) > tail_offset:
-                anchors[tail_seq] = {
-                    "name": unit["name"],
-                    "size": len(raw) - tail_offset,
-                    "sha256": _sha256(raw[tail_offset:]),
-                }
-            elif not parts:
-                # Legacy/active unit with no preserved material: its whole
-                # bytes are one implicit window.
-                anchors[tail_seq] = {
-                    "name": unit["name"],
-                    "size": len(raw),
-                    "sha256": _sha256(raw),
-                }
 
             # Whole-line scan: a piece after the final newline is a crashed
             # half line -- never a record, and irrelevant when out of range.
@@ -1203,35 +1267,45 @@ class Chain:
                     seq = tail_seq
                     window_start = tail_offset
                 if start <= count < end:
+                    if seq not in anchors:
+                        if win_index < len(parts):
+                            part = parts[win_index]
+                            anchors[seq] = {
+                                "name": part["name"],
+                                "size": part["size"],
+                                "sha256": part["sha256"],
+                            }
+                        else:
+                            anchors[seq] = {
+                                "name": unit["name"],
+                                "size": len(raw) - tail_offset,
+                                "sha256": _sha256(raw[tail_offset:]),
+                            }
                     buckets.setdefault(seq, []).append(
                         (count, line_start - window_start, record)
                     )
                 count += 1
 
-            global_seq += len(parts) + (1 if len(raw) > tail_offset or not parts else 0)
+            global_seq += len(parts) + (
+                1 if len(raw) > tail_offset or not parts else 0
+            )
 
-        if count == 0:
-            if (start, end) == (0, 0):
-                return {
-                    "tenant": tenant,
-                    "start": 0,
-                    "end": 0,
-                    "count": 0,
-                    "prev": "",
-                    "anchors": {},
-                    "buckets": [],
-                }
-            raise ValueError("range is out of bounds for an empty history")
-        if start == end:
-            raise ValueError("range must be a non-empty interval")
-        if start >= count or end > count:
-            raise ValueError("range is out of bounds")
+        if ranges is None:
+            if count == 0:
+                if (start, end) == (0, 0):
+                    return _empty_material(tenant)
+                raise ValueError("range is out of bounds for an empty history")
+            if start == end:
+                raise ValueError("range must be a non-empty interval")
+            if start >= count or end > count:
+                raise ValueError("range is out of bounds")
+            total = count
 
         return {
             "tenant": tenant,
             "start": start,
             "end": end,
-            "count": count,
+            "count": total,
             "prev": predecessor if predecessor is not None else "",
             "anchors": anchors,
             "buckets": [
@@ -1243,6 +1317,19 @@ class Chain:
     def _delete_cache(self, layout: st.Layout) -> None:
         with contextlib.suppress(FileNotFoundError):
             os.remove(layout.cache_path)
+
+
+def _empty_material(tenant: str) -> dict:
+    """Export material for a tenant with no records (the (0, 0) interval)."""
+    return {
+        "tenant": tenant,
+        "start": 0,
+        "end": 0,
+        "count": 0,
+        "prev": "",
+        "anchors": {},
+        "buckets": [],
+    }
 
 
 def _cache_entry(

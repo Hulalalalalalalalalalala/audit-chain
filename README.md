@@ -46,7 +46,11 @@ Additional entry points:
 
 `audit_chain.verify_proof(proof, *, tenant=None, start=None, end=None)`
 verifies an exported proof with the public digest function alone; it never
-touches the log.
+touches the log. `audit_chain.combine_proofs(left, right)` joins two
+adjacent proofs of one tenant into a single proof for the union interval,
+and `audit_chain.verify_proofs(proofs)` verifies a batch of proofs offline,
+returning one verdict per proof in input order, each shaped like the
+on-chain `verify` result.
 
 ### Snapshot consistency
 
@@ -81,6 +85,24 @@ window chain using `verify_proof` (and the public digest) alone. Damage
 outside the interval cannot affect its conclusion. Empty or reversed
 intervals, non-integer or out-of-bounds ranges raise `ValueError`; a tenant
 with no history returns a verifiable empty-history proof for `(0, 0)`.
+Export reads and hashes in proportion to the exported interval, not the
+history length.
+
+### Proof combination and batch verification
+
+`combine_proofs(left, right)` joins two proofs of one tenant whose
+intervals touch (`left.end == right.start`) into an ordinary proof for the
+union interval that `verify_proof` (and the `verify-proof` subcommand)
+checks exactly like a direct export; joining three adjacent proofs is
+associative. A side that is not a dict raises `TypeError`; a side that is
+malformed or does not verify on its own, mismatched tenants, gaps,
+overlaps, reversed intervals or proofs that do not chain raise
+`ValueError`. `verify_proofs(proofs)` returns one verdict per proof in
+input order, each `{"count", "first_bad", "ok"}` like the on-chain `verify`
+result, with `count` the number of records the proof covers and `first_bad`
+the global tenant index; one tampered proof never aborts the batch. An
+empty list raises `ValueError`, a non-dict element `TypeError`. Combined
+proofs stay verifiable after the log is compacted, damaged or discarded.
 
 ### Crash recovery
 
