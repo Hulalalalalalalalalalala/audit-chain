@@ -403,8 +403,11 @@ class Chain:
                 os.close(fd)
 
             # Warm the cache with the single record just written: suffix
-            # only, never a rehash of the whole file.
-            self._walk(self._view(layout), layout)
+            # only, never a rehash of the whole file. This call is still
+            # inside the exclusive lock and the prefix could not have changed
+            # since the states above were computed, so the continuation is
+            # trusted by construction.
+            self._walk(self._view(layout), layout, trust_growth=True)
         return record
 
     # ------------------------------------------------------------------
@@ -711,7 +714,11 @@ class Chain:
             cache_segments.pop(source["name"], None)
         if carried is not None:
             cache_segments[name] = _cache_entry(
-                carried["records"], os.stat(target), parts, _states_from(carried)
+                carried["records"],
+                os.stat(target),
+                parts,
+                _states_from(carried),
+                _fold_of_bytes(merged),
             )
         manifest["segments"] = [
             {"name": name, "sealed": False, "parts": parts}
@@ -736,7 +743,11 @@ class Chain:
             cache_segments.pop(source["name"], None)
         if carried is not None:
             cache_segments[name] = _cache_entry(
-                carried["records"], os.stat(target), parts, _states_from(carried)
+                carried["records"],
+                os.stat(target),
+                parts,
+                _states_from(carried),
+                _fold_of_bytes(merged),
             )
         return [source["name"] for source in sources]
 
@@ -797,6 +808,7 @@ class Chain:
         *,
         ignore_cache: bool = False,
         persist: bool = True,
+        trust_growth: bool = False,
     ) -> tuple[dict[str, tuple[int, int, int]], dict]:
         """Walk every unit in order, reusing authenticated cached prefixes.
 
@@ -841,51 +853,129 @@ class Chain:
                     continue
                 raise
             entry = cached.get(name)
+            entry_fold = entry.get("fold") if entry is not None else None
 
-            if entry is not None and not desynced and self._entry_fresh(
-                entry, stat, unit
+            if (
+                entry is not None
+                and entry_fold is not None
+                and not desynced
+                and self._entry_fresh(entry, stat, unit)
             ):
                 self._adopt_states(states, entry)
                 total_records = entry["records"]
                 entries[name] = _cache_entry(
-                    total_records, stat, entry["parts"], states
+                    total_records, stat, entry["parts"], states, entry_fold
                 )
                 continue
 
-            if (
+            growth = (
                 entry is not None
+                and entry_fold is not None
                 and not desynced
                 and not unit["sealed"]
                 and stat.st_size > entry["size"]
                 and entry.get("parts", []) == unit["parts"]
-            ):
-                # Appended-only growth on the active unit. Writers are
-                # lock-serialized and O_APPEND-only, and the writer warms
-                # this cache itself; an unwarmed growth (crashed writer,
-                # out-of-band append) is still safe because the suffix's
-                # predecessor links must match the cached heads and its
-                # preserved prefix windows must match, so a rewritten prefix
-                # or edited manifest window cannot ride the suffix branch.
-                # Only the suffix is parsed and hashed.
-                self._adopt_states(states, entry)
-                with open(path, "rb") as handle:
-                    handle.seek(entry["size"])
-                    tail = handle.read()
-                records = st.decode_records(tail)
-                self._apply_records(records, states)
-                total_records = entry["records"] + len(records)
-                # Appended-only growth leaves the preserved prefix windows
-                # untouched, so carry their material forward in the cache.
-                entries[name] = _cache_entry(
-                    total_records, stat, entry.get("parts", []), states
-                )
-                continue
+            )
+            if growth:
+                # Appended-only growth on the active unit. Before the cache's
+                # cumulative states are continued, the bytes the cache was
+                # built on authenticate themselves byte for byte: a fold over
+                # every complete line up to the cached size must equal the
+                # fold stored in the (tag-authenticated) cache. A rewritten
+                # prefix -- stale digests, recomputed digests, edited bytes
+                # behind preserved manifest windows, a shifted boundary --
+                # changes that fold, so the continuation is refused and the
+                # walk falls through to a complete re-derivation, whose
+                # verdict equals a full verification and whose first bad
+                # index is the real position rather than the first new line.
+                #
+                # The writer warming the cache for the line it just appended
+                # still holds the exclusive lock and the prefix is unchanged
+                # by construction, so it extends the fold over the new lines
+                # only.
+                if trust_growth:
+                    with open(path, "rb") as handle:
+                        handle.seek(entry["size"])
+                        tail_raw = handle.read()
+                    tail_lines = _split_whole_lines(tail_raw)
+                    if tail_lines is not None:
+                        candidate = {
+                            tenant: list(state) for tenant, state in states.items()
+                        }
+                        self._adopt_states(candidate, entry)
+                        before_bad = {
+                            tenant: state[2] for tenant, state in candidate.items()
+                        }
+                        tail_records = st.decode_records(b"".join(tail_lines))
+                        self._apply_records(tail_records, candidate)
+                        tail_broken = any(
+                            state[2] != before_bad.get(tenant, -1)
+                            for tenant, state in candidate.items()
+                        )
+                        new_fold = _extend_fold(entry_fold, tail_lines)
+                    else:
+                        candidate = None
+                        tail_broken = True
+                        new_fold = entry_fold
+                    if candidate is not None and not tail_broken:
+                        states.clear()
+                        states.update(candidate)
+                        total_records = entry["records"] + len(tail_records)
+                        # Appended-only growth leaves the preserved prefix
+                        # windows untouched, so carry their material in the
+                        # cache.
+                        entries[name] = _cache_entry(
+                            total_records, stat, entry.get("parts", []), states, new_fold
+                        )
+                        continue
+                else:
+                    with open(path, "rb") as handle:
+                        raw = handle.read()
+                    prefix_raw = raw[: entry["size"]]
+                    tail_raw = raw[entry["size"] :]
+                    prefix_lines = _split_whole_lines(prefix_raw)
+                    tail_lines = _split_whole_lines(tail_raw)
+                    prefix_ok = (
+                        prefix_lines is not None
+                        and _fold_lines(prefix_lines) == entry_fold
+                    )
+                    if prefix_ok and tail_lines is not None:
+                        candidate = {
+                            tenant: list(state)
+                            for tenant, state in states.items()
+                        }
+                        self._adopt_states(candidate, entry)
+                        before_bad = {
+                            tenant: state[2] for tenant, state in candidate.items()
+                        }
+                        tail_records = st.decode_records(b"".join(tail_lines))
+                        self._apply_records(tail_records, candidate)
+                        tail_broken = any(
+                            state[2] != before_bad.get(tenant, -1)
+                            for tenant, state in candidate.items()
+                        )
+                        if not tail_broken:
+                            states.clear()
+                            states.update(candidate)
+                            total_records = entry["records"] + len(tail_records)
+                            new_fold = _extend_fold(entry_fold, tail_lines)
+                            entries[name] = _cache_entry(
+                                total_records,
+                                stat,
+                                entry.get("parts", []),
+                                states,
+                                new_fold,
+                            )
+                            continue
+                    # Prefix authentication failed or the boundary moved:
+                    # re-derive this unit completely below.
 
             # Cold unit, shrink, same-size rewrite, any change to a sealed
-            # unit, or a unit following one that desynced: full parse; sealed
-            # windows are re-authenticated and every link is re-derived.
+            # unit, a unit following one that desynced, or a growth whose
+            # cached prefix failed authentication: full parse; sealed windows
+            # are re-authenticated and every link is re-derived.
             desynced = True
-            walked, parts, failed_tenants = self._walk_bytes(unit, states)
+            walked, parts, failed_tenants, fold = self._walk_bytes(unit, states)
             for tenant, index in failed_tenants.items():
                 suspect.setdefault(tenant, index)
             if entry is not None:
@@ -911,7 +1001,7 @@ class Chain:
                         if remaining < anchored[0]:
                             suspect.setdefault(tenant, remaining)
             total_records += walked
-            entries[name] = _cache_entry(total_records, stat, parts, states)
+            entries[name] = _cache_entry(total_records, stat, parts, states, fold)
 
         # A chain break attributes first_bad precisely and is used as-is.
         # Separately, every tenant with a record in a content-hash-failed
@@ -987,12 +1077,14 @@ class Chain:
 
     def _walk_bytes(
         self, unit: dict, states: dict[str, list]
-    ) -> tuple[int, list[dict], dict]:
+    ) -> tuple[int, list[dict], dict, str]:
         """Parse and chain one unit's bytes.
 
-        Returns ``(record_count, cache_parts, failed_tenants)`` where
+        Returns ``(record_count, cache_parts, failed_tenants, fold)`` where
         ``failed_tenants`` maps each tenant with a record in a
-        content-hash-failed window to that record's global index.
+        content-hash-failed window to that record's global index, and
+        ``fold`` is the extendable byte fingerprint of the unit's complete
+        lines.
 
         Content tampering normally breaks the victim's digest chain, which
         attributes ``first_bad`` precisely and leaves tenants with no record
@@ -1062,7 +1154,10 @@ class Chain:
         # Both are retained in the cache so the hot-path freshness guard
         # compares the manifest's window material for either kind.
         parts = [dict(part) for part in windows]
-        return len(lines), parts, first_index
+        # split_records guaranteed raw ends in a terminator, so this folds
+        # every complete line exactly as the continuation branch will.
+        fold = _fold_of_bytes(raw)
+        return len(lines), parts, first_index, fold
 
     def _apply_records(self, records: list[dict], states: dict[str,list]) -> None:
         for record in records:
@@ -1479,7 +1574,11 @@ class Chain:
 
 
 def _cache_entry(
-    records: int, stat: os.stat_result, parts: list[dict], states: dict[str, list]
+    records: int,
+    stat: os.stat_result,
+    parts: list[dict],
+    states: dict[str, list],
+    fold: str,
 ) -> dict:
     return {
         "records": records,
@@ -1487,8 +1586,56 @@ def _cache_entry(
         "mtime_ns": stat.st_mtime_ns,
         "ctime_ns": stat.st_ctime_ns,
         "parts": parts,
+        "fold": fold,
         "tenants": {tenant: list(state) for tenant, state in states.items()},
     }
+
+
+# Empty fold seed and the per-line chaining. A fold is a byte-for-byte
+# fingerprint of a unit's complete lines that can be extended over appended
+# lines in O(new bytes) without re-reading the prefix: the cache stores the
+# authenticated fold at the cached size, so a continued verify first proves
+# every byte before that boundary is unchanged before trusting any cached
+# cumulative state. A rewritten prefix (stale or recomputed digests, bytes
+# edited behind preserved manifest windows) changes the fold and forces a
+# full recompute. Chaining on the hex digest keeps this working under a
+# sha256 stand-in that only exposes ``update``/``hexdigest``.
+_FOLD_BLANK = hashlib.sha256(b"").hexdigest()
+
+
+def _fold_accumulate(acc: str, lines: list[bytes]) -> str:
+    for line in lines:
+        acc = hashlib.sha256(acc.encode("ascii") + line).hexdigest()
+    return acc
+
+
+def _fold_lines(lines: list[bytes]) -> str:
+    return _fold_accumulate(_FOLD_BLANK, lines)
+
+
+def _extend_fold(fold: str, lines: list[bytes]) -> str:
+    return _fold_accumulate(fold, lines)
+
+
+def _split_whole_lines(raw: bytes) -> Optional[list[bytes]]:
+    """Split bytes that are exactly a sequence of newline-ended lines.
+
+    Returns the lines (each with its terminator) or None when the bytes end
+    in a partial line -- which, at a cached-size boundary, means the prefix
+    was rewritten and the boundary moved mid-line.
+    """
+    if raw == b"":
+        return []
+    if not raw.endswith(b"\n"):
+        return None
+    # Canonical JSON escapes embedded newlines, so a raw 0x0A is only ever a
+    # record terminator.
+    return [piece + b"\n" for piece in raw.split(b"\n")[:-1]]
+
+
+def _fold_of_bytes(raw: bytes) -> str:
+    lines = _split_whole_lines(raw)
+    return _fold_lines(lines if lines is not None else [])
 
 
 def _states_from(carried: dict) -> dict:

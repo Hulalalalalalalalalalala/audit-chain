@@ -287,7 +287,8 @@ def combine_proofs(left: Any, right: Any) -> dict:
 def verify_proofs(proofs: Any) -> list[dict]:
     """Verify a batch of proofs, one verdict per proof, in input order.
 
-    Each verdict has exactly the shape :func:`verify_proof` returns. A proof
+    Each verdict has exactly the shape the on-chain ``Chain.verify`` returns
+    -- ``{"ok": bool, "first_bad": i, "count": n}`` and nothing else. A proof
     whose content was tampered with yields an ``ok=False`` verdict carrying
     the real first bad index; verification of the remaining proofs continues.
     A structurally malformed proof likewise yields a corrupted verdict
@@ -306,7 +307,7 @@ def verify_proofs(proofs: Any) -> list[dict]:
         if not isinstance(proof, dict):
             raise TypeError("each proof must be a dict")
         try:
-            verdicts.append(verify_proof(proof))
+            verdicts.append(_chain_verdict(verify_proof(proof)))
         except ValueError:
             # Structurally malformed: no chain walk was possible, so there is
             # no record-derived bad index. Report corruption at the earliest
@@ -339,12 +340,18 @@ def _clone_window(window: dict) -> dict:
     }
 
 
+def _chain_verdict(verdict: dict) -> dict:
+    """Project a proof verdict onto the on-chain verdict's three keys."""
+    return {
+        "ok": verdict["ok"],
+        "first_bad": verdict["first_bad"],
+        "count": verdict["count"],
+    }
+
+
 def _corrupted_verdict(proof: dict) -> dict:
-    tenant = proof.get("tenant")
     start = proof.get("start")
     end = proof.get("end")
-    if not isinstance(tenant, str):
-        tenant = ""
     if not _nonneg_int(start):
         start = 0
     if not _nonneg_int(end) or end < start:
@@ -353,9 +360,6 @@ def _corrupted_verdict(proof: dict) -> dict:
         "ok": False,
         "first_bad": start,
         "count": end - start,
-        "start": start,
-        "end": end,
-        "tenant": tenant,
     }
 
 

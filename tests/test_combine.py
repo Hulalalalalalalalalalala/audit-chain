@@ -199,9 +199,15 @@ class VerifyProofsBatchTest(AuditTestCase):
         verdicts = verify_proofs(proofs)
         self.assertEqual(len(verdicts), 3)
         for proof, verdict in zip(proofs, verdicts):
-            self.assertEqual(verdict, verify_proof(proof))
-        self.assertEqual([v["start"] for v in verdicts], [0, 10, 40])
-        self.assertEqual([v["end"] for v in verdicts], [10, 40, 50])
+            full = verify_proof(proof)
+            self.assertEqual(
+                verdict,
+                {
+                    "ok": full["ok"],
+                    "first_bad": full["first_bad"],
+                    "count": full["count"],
+                },
+            )
         self.assertEqual([v["count"] for v in verdicts], [10, 30, 10])
         self.assertTrue(all(v["ok"] for v in verdicts))
 
@@ -228,9 +234,7 @@ class VerifyProofsBatchTest(AuditTestCase):
         self.assertFalse(verdicts[2]["ok"])
         self.assertTrue(verdicts[3]["ok"])
         # The bad verdict still has the on-chain verdict shape.
-        self.assertEqual(
-            set(verdicts[1]), {"ok", "first_bad", "count", "start", "end", "tenant"}
-        )
+        self.assertEqual(set(verdicts[1]), {"ok", "first_bad", "count"})
 
     def test_batch_empty_list_is_value_error(self) -> None:
         with self.assertRaises(ValueError):

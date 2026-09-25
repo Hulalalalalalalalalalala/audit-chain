@@ -115,12 +115,24 @@ def atomic_write_bytes(directory: str, name: str, raw: bytes) -> None:
 
 
 def fsync_dir(directory: str) -> None:
+    """Best-effort directory sync; never fails the caller.
+
+    Some environments (notably Windows, where a directory cannot be opened
+    as a file handle at all) provide no way to sync a directory. Append and
+    recovery must still complete there, so an ``OSError`` from opening or
+    syncing the directory is tolerated: the atomic-rename commit protocol
+    already keeps every crash window on one complete topology.
+    """
     flags = os.O_RDONLY
     if hasattr(os, "O_DIRECTORY"):
         flags |= os.O_DIRECTORY
-    fd = os.open(directory, flags)
     try:
-        os.fsync(fd)
+        fd = os.open(directory, flags)
+    except OSError:
+        return
+    try:
+        with contextlib.suppress(OSError):
+            os.fsync(fd)
     finally:
         os.close(fd)
 
@@ -544,6 +556,17 @@ def _valid_cache_segments(segments: Any) -> bool:
             return False
         for part in parts:
             if not _valid_part(part):
+                return False
+        # The fold is absent only in a structurally-valid pre-fold cache,
+        # which the walker rebuilds from bytes; a present but malformed fold
+        # cannot be trusted and is treated like any forged field.
+        fold = entry.get("fold")
+        if fold is not None:
+            if not isinstance(fold, str) or len(fold) != 64:
+                return False
+            try:
+                int(fold, 16)
+            except ValueError:
                 return False
         tenants = entry.get("tenants")
         if not isinstance(tenants, dict):
