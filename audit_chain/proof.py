@@ -287,7 +287,8 @@ def combine_proofs(left: Any, right: Any) -> dict:
 def verify_proofs(proofs: Any) -> list[dict]:
     """Verify a batch of proofs, one verdict per proof, in input order.
 
-    Each verdict has exactly the shape :func:`verify_proof` returns. A proof
+    Each verdict has exactly the on-chain verdict's shape --
+    ``{"ok": bool, "first_bad": i, "count": n}`` and nothing else. A proof
     whose content was tampered with yields an ``ok=False`` verdict carrying
     the real first bad index; verification of the remaining proofs continues.
     A structurally malformed proof likewise yields a corrupted verdict
@@ -306,12 +307,19 @@ def verify_proofs(proofs: Any) -> list[dict]:
         if not isinstance(proof, dict):
             raise TypeError("each proof must be a dict")
         try:
-            verdicts.append(verify_proof(proof))
+            verdict = verify_proof(proof)
         except ValueError:
             # Structurally malformed: no chain walk was possible, so there is
             # no record-derived bad index. Report corruption at the earliest
             # index the proof itself claims, keeping the verdict shape.
-            verdicts.append(_corrupted_verdict(proof))
+            verdict = _corrupted_verdict(proof)
+        verdicts.append(
+            {
+                "ok": verdict["ok"],
+                "first_bad": verdict["first_bad"],
+                "count": verdict["count"],
+            }
+        )
     return verdicts
 
 

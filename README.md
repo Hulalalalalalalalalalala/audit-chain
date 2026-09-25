@@ -58,10 +58,11 @@ Two more offline entry points work purely on proof objects (no log):
   `TypeError`; a side that is not a valid exporting proof or does not verify,
   or a tenant mismatch / gap / overlap / reversed order, is `ValueError`.
 - `audit_chain.verify_proofs(proofs) -> list[dict]` verifies a batch and
-  returns one verdict per proof, in input order, each with the same shape as
-  the on-chain verdict. A tampered proof yields an `ok=False` verdict with the
-  real global bad index without interrupting the rest. An empty list is
-  `ValueError`; the argument or an element that is not a dict is `TypeError`.
+  returns one verdict per proof, in input order, each with exactly the
+  on-chain verdict's shape (`ok`, `first_bad`, `count`). A tampered proof
+  yields an `ok=False` verdict with the real global bad index without
+  interrupting the rest. An empty list is `ValueError`; the argument or an
+  element that is not a dict is `TypeError`.
 
 ### Snapshot consistency
 
@@ -70,6 +71,13 @@ one fixed unit list in one ordered pass, while append/rotate/compact/recover
 run under an exclusive lock. A single call therefore always observes one
 complete prefix — the topology immediately before or immediately after a
 rotation or merge — never mixed segments, a duplicated run or a skipped run.
+
+Concurrent appends are linearizable: the exclusive writer lock serializes
+them into one unique global order, each record links strictly behind its
+predecessor, and per-tenant indices stay continuous and zero-based. Once a
+writer's `append` has returned, its record is immediately visible to any
+subsequent `entries`, `verify` or `head` call (read-your-writes), and no
+writer is starved out of the lock.
 
 ### Incremental, constant-read-amplification verification
 
@@ -126,7 +134,10 @@ flush/fsync, segment rename, manifest replacement, old-segment deletion)
 reopens onto either the old topology or the complete new one: a migration
 backup is adopted, a staged directory / orphan segment / residual temp file
 is reaped by the next writer, and a half-written tail line keeps its bad-line
-semantics until `recover()` truncates it.
+semantics until `recover()` truncates it. Directory synchronization is
+best-effort, so environments where a directory cannot be opened for syncing
+(such as Windows temporary directories) still complete appends, rotation,
+compaction and recovery.
 
 ## Tests
 

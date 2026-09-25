@@ -115,12 +115,23 @@ def atomic_write_bytes(directory: str, name: str, raw: bytes) -> None:
 
 
 def fsync_dir(directory: str) -> None:
+    """Best-effort sync of a directory entry's durability.
+
+    Some environments cannot open a directory for synchronization at all
+    (e.g. Windows, where ``os.open`` on a directory fails); the data file
+    itself was already fsynced, so a directory that refuses the sync simply
+    skips it and the operation still completes.
+    """
     flags = os.O_RDONLY
     if hasattr(os, "O_DIRECTORY"):
         flags |= os.O_DIRECTORY
-    fd = os.open(directory, flags)
     try:
-        os.fsync(fd)
+        fd = os.open(directory, flags)
+    except OSError:
+        return
+    try:
+        with contextlib.suppress(OSError):
+            os.fsync(fd)
     finally:
         os.close(fd)
 
