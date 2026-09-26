@@ -42,6 +42,9 @@ silently.
 - `head(tenant) -> str | None` returns the newest digest.
 - `export_range(tenant, start, end) -> dict` builds an offline proof for the
   half-open interval `[start, end)` (see below).
+- `export_shards(tenant, start, end, window_size)` lazily streams the same
+  interval as window-sized shards, each an ordinary offline proof (see
+  below).
 
 Additional entry points:
 - `recover() -> {"truncated_bytes": n}` truncates a half-written tail line
@@ -69,6 +72,17 @@ Two more offline entry points work purely on proof objects (no log):
   the on-chain verdict. A tampered proof yields an `ok=False` verdict with the
   real global bad index without interrupting the rest. An empty list is
   `ValueError`; the argument or an element that is not a dict is `TypeError`.
+- `audit_chain.verify_shards(shards) -> {"overall": verdict, "shards":
+  [verdict, ...]}` verifies an ordered shard sequence tiling one interval
+  (the output of `export_shards`): each shard is checked independently and
+  the per-shard verdicts come back in input order, then the whole-interval
+  conclusion. Every verdict has exactly the `verify_proof` shape, and the
+  overall conclusion agrees with one full offline verification of the
+  reassembled interval item by item, including cross-shard chain links.
+  A tampered shard yields a corrupted verdict with the real global bad
+  index without interrupting the rest. An empty list or a non-dict element
+  is `TypeError`; a tenant mismatch, gap or overlap between shards is
+  `ValueError`.
 
 `audit_chain.extend_proof(proof, path) -> dict` continues an exported (or
 combined) proof against the store at `path`: the result is an ordinary proof
@@ -151,6 +165,34 @@ mixed topology — and splices the increment on with `combine_proofs`. The
 result is an ordinary proof to the current prefix; it writes nothing to the
 store, so an interrupted extension leaves no temp files or half-built state
 and can simply be retried.
+
+### Windowed shard streaming
+
+`export_shards(tenant, start, end, window_size)` streams one interval export
+as a lazy sequence of shards: the interval is cut, in order, into contiguous
+shards of at most `window_size` records (the last shard carries the
+remainder), so the shards tile `[start, end)` end-to-end with no gap or
+overlap. Every shard is an ordinary version-1 proof that verifies on its own
+with `verify_proof`, and feeding the sequence to `combine_proofs` restores a
+proof of the whole interval whose offline conclusion is identical to one
+full `export_range` of the same interval. The whole stream is produced under
+one shared lock, so a concurrent append, rotation, merge or archive
+migration never mixes topologies into it — every shard describes the same
+complete prefix. Records are streamed line by line and only one shard is
+materialized at a time, so memory and digest work track a single window,
+never the interval or the history length. Nothing is written to the store:
+an interrupted stream leaves no temp files or half-built state, and
+restarting it yields a byte-identical shard sequence. A non-positive or
+non-integer window size, non-integer or negative bounds, an empty or
+reversed interval, or an interval past the tenant's history is `ValueError`.
+
+`verify_shards(shards)` consumes such a sequence shard by shard: it checks
+each shard independently, returns the per-shard verdicts in input order, and
+finishes with the whole-interval conclusion — the same shape and the same
+values as one offline `verify_proof` of the reassembled interval, with
+`first_bad` landing on the real first bad record. A single tampered shard is
+reported as corrupted with its real bad index and does not interrupt the
+remaining shards.
 
 ### Export cost
 

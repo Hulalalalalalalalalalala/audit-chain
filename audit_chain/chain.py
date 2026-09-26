@@ -41,6 +41,13 @@ semantics:
   chained, and the increment is spliced on with ``combine_proofs``, so
   the cost tracks the increment and the result is an ordinary offline
   proof of the same shape;
+* ``export_shards`` streams one interval export as a lazy sequence of
+  window-sized shards, each an ordinary offline proof: the shards tile
+  the interval end-to-end with no gap or overlap, memory and digest
+  work track a single window rather than the interval, and the whole
+  sequence is produced under one shared lock, so a concurrent append,
+  rotation, merge or archive migration never mixes topologies into the
+  stream;
 * ``recover`` is the explicit entry point that truncates a half-written
   tail line left by a killed process.
 """
@@ -50,7 +57,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import os
-from typing import Any, Optional
+from typing import Any, Iterator, Optional
 
 from . import record as rec
 from . import storage as st
@@ -2081,9 +2088,306 @@ class Chain:
             count += 1
         return count, head, bad
 
+    # ------------------------------------------------------------------
+    # Windowed shard streaming export
+    # ------------------------------------------------------------------
+
+    def export_shards(
+        self, tenant: str, start: int, end: int, window_size: int
+    ) -> "Iterator[dict]":
+        """Stream the interval ``[start, end)`` as window-sized shards.
+
+        Returns a lazy iterator of ordinary version-1 range proofs: the
+        interval is cut, in order, into contiguous shards of at most
+        ``window_size`` records (the last shard carries the remainder),
+        so the shards tile ``[start, end)`` end-to-end with no gap or
+        overlap. Every shard is independently verifiable with
+        :func:`audit_chain.proof.verify_proof`, and feeding the sequence
+        to :func:`audit_chain.proof.combine_proofs` restores a proof of
+        the whole interval whose offline conclusion is identical to one
+        full :meth:`export_range` of the same interval.
+
+        The stream is produced under one shared lock: a concurrent
+        append, rotation, merge or archive migration never mixes
+        topologies into it, so every shard describes the same complete
+        prefix. Records are streamed line by line and only one shard is
+        materialized at a time, so memory and digest work track a single
+        window, never the interval or the history length. Nothing is
+        written to the store: an interrupted stream leaves no temp files
+        or half-built state behind, and restarting it from scratch
+        yields a byte-identical shard sequence.
+
+        A non-positive or non-integer ``window_size``, non-integer or
+        negative bounds, and an empty or reversed interval raise
+        ``ValueError`` immediately; an interval past the tenant's
+        history (including a missing log) raises ``ValueError`` when the
+        stream is first advanced.
+        """
+        if (
+            not isinstance(window_size, int)
+            or isinstance(window_size, bool)
+            or window_size <= 0
+        ):
+            raise ValueError("window size must be a positive integer")
+        if (
+            not isinstance(start, int)
+            or not isinstance(end, int)
+            or isinstance(start, bool)
+            or isinstance(end, bool)
+        ):
+            raise ValueError("range bounds must be integers")
+        if start < 0 or end < 0:
+            raise ValueError("range bounds must be non-negative")
+        if end < start:
+            raise ValueError("range is reversed: start must be <= end")
+        if start == end:
+            raise ValueError("range must be a non-empty interval")
+        return self._export_shards(tenant, start, end, window_size)
+
+    def _export_shards(
+        self, tenant: str, start: int, end: int, window_size: int
+    ) -> "Iterator[dict]":
+        """Generator body of :meth:`export_shards` (one locked snapshot)."""
+        from . import proof as pf
+
+        with self._locked(exclusive=False) as layout:
+            if layout.kind == "file" and not os.path.exists(layout.root):
+                raise ValueError("range is out of bounds for an empty history")
+            units = self._snapshot_units(layout, tolerate_metadata=True)
+            # Fast path: an authentic warm cache states each unit's
+            # cumulative tenant count. With no trustworthy guide, count
+            # the tenant's records in one ordered streaming pass.
+            counts = self._export_guide(units, layout, tenant)
+            if counts is None:
+                counts = self._stream_tenant_counts(units, tenant)
+            total = counts[-1] if counts else 0
+            if total == 0 or start >= total or end > total:
+                raise ValueError("range is out of bounds")
+
+            first_unit = self._first_unit_for(counts, start)
+            last_unit = self._first_unit_for(counts, end - 1)
+
+            shard: Optional[_ShardBuilder] = None
+            done = False
+            for ui in range(first_unit, last_unit + 1):
+                if done:
+                    break
+                unit = units[ui]
+                parts = unit["parts"]
+                window_ends: list[int] = []
+                running = 0
+                for part in parts:
+                    running += part["size"]
+                    window_ends.append(running)
+                try:
+                    handle = open(unit["path"], "rb")
+                except FileNotFoundError:
+                    if not unit["sealed"]:
+                        continue
+                    raise
+                with handle:
+                    pos = 0
+                    local = counts[ui - 1] if ui else 0
+                    for line in handle:
+                        line_start = pos
+                        pos += len(line)
+                        if not line.endswith(b"\n"):
+                            # A trailing half line is never a record.
+                            break
+                        try:
+                            record = st.decode_records(line)[0]
+                        except ValueError:
+                            record = None
+                        if record is None or record["tenant"] != tenant:
+                            # Any physical line that is not an interval
+                            # record splits the pending tail run.
+                            if shard is not None:
+                                shard.break_run()
+                            continue
+                        if local >= start:
+                            if shard is None:
+                                shard = _ShardBuilder(
+                                    tenant, local, total, record["prev"]
+                                )
+                            win_index = 0
+                            while (
+                                win_index < len(window_ends)
+                                and line_start >= window_ends[win_index]
+                            ):
+                                win_index += 1
+                            if win_index < len(window_ends):
+                                window_start = (
+                                    window_ends[win_index - 1] if win_index else 0
+                                )
+                                shard.add_sealed(
+                                    ui,
+                                    win_index,
+                                    parts[win_index],
+                                    local,
+                                    line_start - window_start,
+                                    record,
+                                )
+                            else:
+                                shard.add_tail(
+                                    unit["name"], line, line_start, local, record
+                                )
+                            if shard.size == window_size:
+                                yield pf.build_proof(shard.build(local + 1))
+                                shard = None
+                        local += 1
+                        if local >= end:
+                            # The interval's last record was emitted; the
+                            # rest of the history is never read.
+                            done = True
+                            break
+            if shard is not None:
+                yield pf.build_proof(shard.build(end))
+
+    def _stream_tenant_counts(
+        self, units: list[dict], tenant: str
+    ) -> list[int]:
+        """Cumulative tenant record counts per unit, streamed line by line.
+
+        Fallback guide when the verify cache cannot vouch for per-unit
+        counts: one ordered pass that only counts well-formed records of
+        the tenant, mirroring the range collector's counting exactly
+        (complete newline-terminated lines only, malformed lines and a
+        trailing half line skipped). No digest work is done.
+        """
+        counts: list[int] = []
+        total = 0
+        for unit in units:
+            try:
+                handle = open(unit["path"], "rb")
+            except FileNotFoundError:
+                if not unit["sealed"]:
+                    counts.append(total)
+                    continue
+                raise
+            with handle:
+                for line in handle:
+                    if not line.endswith(b"\n"):
+                        break
+                    try:
+                        record = st.decode_records(line)[0]
+                    except ValueError:
+                        continue
+                    if record["tenant"] == tenant:
+                        total += 1
+            counts.append(total)
+        return counts
+
     def _delete_cache(self, layout: st.Layout) -> None:
         with contextlib.suppress(FileNotFoundError):
             os.remove(layout.cache_path)
+
+
+class _ShardBuilder:
+    """Accumulates one export shard's windows while records stream by.
+
+    Memory is bounded by a single shard: records that fall inside a
+    preserved byte window only reference the window's manifest anchor,
+    and a tail run holds just the shard's own physically consecutive
+    lines. The accumulated material matches the shape
+    :func:`audit_chain.proof.build_proof` consumes, so a finished shard
+    is assembled by the same path as a one-shot range export.
+    """
+
+    def __init__(self, tenant: str, start: int, count: int, prev: str):
+        self.tenant = tenant
+        self.start = start
+        self.count = count
+        self.prev = prev
+        self.size = 0
+        self._emitted: list[dict] = []
+        self._sealed_slots: dict[tuple[int, int], int] = {}
+        self._run: Optional[list] = None
+        self._run_end: Optional[int] = None
+
+    def break_run(self) -> None:
+        """A physical line outside the interval splits the tail run."""
+        self._flush_run()
+
+    def _flush_run(self) -> None:
+        if self._run is not None:
+            blob, slots, name = self._run
+            self._emitted.append(
+                {"part": None, "name": name, "blob": blob, "records": slots}
+            )
+            self._run = None
+            self._run_end = None
+
+    def add_sealed(
+        self,
+        unit_index: int,
+        window_index: int,
+        part: dict,
+        index: int,
+        offset: int,
+        record: dict,
+    ) -> None:
+        """Anchor an interval record living in a preserved byte window."""
+        self._flush_run()
+        key = (unit_index, window_index)
+        slot = self._sealed_slots.get(key)
+        if slot is None:
+            slot = len(self._emitted)
+            self._sealed_slots[key] = slot
+            self._emitted.append({"part": part, "records": []})
+        self._emitted[slot]["records"].append((index, offset, record))
+        self.size += 1
+
+    def add_tail(
+        self, unit_name: str, line: bytes, line_start: int, index: int, record: dict
+    ) -> None:
+        """Anchor an interval record in the un-preserved growing tail.
+
+        Consecutive interval lines share one small window; any
+        intervening physical line (another tenant, an out-of-range
+        record, a bad line) splits it, so the window's bytes contain
+        only interval records.
+        """
+        if self._run is None or line_start != self._run_end:
+            self._flush_run()
+            self._run = [bytearray(), [], unit_name]
+        blob, slots, _name = self._run
+        offset = len(blob)
+        blob += line
+        slots.append((index, offset, record))
+        self._run_end = line_start + len(line)
+        self.size += 1
+
+    def build(self, end: int) -> dict:
+        """Assemble the exporter material for the finished shard."""
+        self._flush_run()
+        anchors: dict[int, dict] = {}
+        buckets: list[dict] = []
+        for seq, entry in enumerate(self._emitted):
+            part = entry["part"]
+            if part is not None:
+                anchor = {
+                    "name": part["name"],
+                    "size": part["size"],
+                    "sha256": part["sha256"],
+                }
+            else:
+                blob = bytes(entry["blob"])
+                anchor = {
+                    "name": entry["name"],
+                    "size": len(blob),
+                    "sha256": _sha256(blob),
+                }
+            anchors[seq] = anchor
+            buckets.append({"seq": seq, "records": entry["records"]})
+        return {
+            "tenant": self.tenant,
+            "start": self.start,
+            "end": end,
+            "count": self.count,
+            "prev": self.prev,
+            "anchors": anchors,
+            "buckets": buckets,
+        }
 
 
 def _cache_entry(

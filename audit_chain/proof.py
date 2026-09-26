@@ -21,6 +21,12 @@ the predecessor links are checked, the indices are checked to be exactly
 windows, and the window sequence is checked to be strictly increasing.
 Damage outside the interval cannot affect this conclusion because no
 out-of-interval byte participates in the check.
+
+One interval can also be exported as a stream of window-sized shards
+(:meth:`audit_chain.Chain.export_shards`): each shard is an ordinary
+proof of this same form, the shards tile the interval end-to-start, and
+:func:`verify_shards` checks such a sequence shard by shard, returning
+one verdict per shard plus the whole-interval conclusion.
 """
 
 from __future__ import annotations
@@ -355,6 +361,128 @@ def verify_proofs(proofs: Any) -> list[dict]:
             # index the proof itself claims, keeping the verdict shape.
             verdicts.append(_corrupted_verdict(proof))
     return verdicts
+
+
+def verify_shards(shards: Any) -> dict:
+    """Verify an ordered shard sequence tiling one interval, shard by shard.
+
+    ``shards`` is the ordered output of ``Chain.export_shards`` -- or any
+    sequence of same-tenant range proofs whose intervals meet
+    end-to-start. Every shard is verified independently, exactly as
+    :func:`verify_proof` would, and the per-shard verdicts are returned
+    in input order; once all shards are checked, the whole-interval
+    conclusion is derived. The result is::
+
+        {"overall": <verdict>, "shards": [<verdict>, ...]}
+
+    where every verdict has exactly the shape :func:`verify_proof`
+    returns (``ok``/``first_bad``/``count``/``start``/``end``/``tenant``)
+    and the overall conclusion agrees with one full offline verification
+    of the reassembled interval item by item: ``first_bad`` is the real
+    first bad global index, whether it comes from a shard's own chain or
+    from a broken link between two shards. A tampered shard yields a
+    corrupted verdict for that shard alone -- carrying its real first
+    bad index -- without interrupting the remaining shards, and a
+    structurally malformed shard is reported as corrupted the same way
+    rather than aborting the sequence.
+
+    The list being empty or an element not being a dict raises
+    ``TypeError``; a tenant mismatch, a gap or an overlap between
+    consecutive shards raises ``ValueError``.
+    """
+    if not isinstance(shards, list):
+        raise TypeError("shards must be a list")
+    if not shards:
+        raise TypeError("shards list must not be empty")
+
+    verdicts: list[dict] = []
+    for shard in shards:
+        if not isinstance(shard, dict):
+            raise TypeError("each shard must be a dict")
+        try:
+            verdicts.append(verify_proof(shard))
+        except ValueError:
+            # Structurally malformed: no chain walk was possible. Report
+            # corruption at the earliest index the shard itself claims,
+            # keeping the verdict shape, and continue with the rest.
+            verdicts.append(_corrupted_shard_verdict(shard))
+
+    for left, right in zip(verdicts, verdicts[1:]):
+        if left["tenant"] != right["tenant"]:
+            raise ValueError("shards are for different tenants")
+        if left["end"] != right["start"]:
+            # One message covers gap, overlap and reversed ordering: the
+            # only accepted relation is end-of-left exactly touching
+            # start-of-right.
+            raise ValueError("shards are not contiguous")
+
+    first_bad = -1
+
+    def flag(index: int) -> None:
+        nonlocal first_bad
+        if first_bad == -1 or index < first_bad:
+            first_bad = index
+
+    for verdict in verdicts:
+        if verdict["first_bad"] != -1:
+            flag(verdict["first_bad"])
+
+    # Cross-shard links: a shard that verifies on its own must still
+    # attach to its predecessor's terminal digest, exactly as the walk
+    # over the reassembled interval would require. A shard that failed
+    # verification cannot vouch for its terminal digest, so the link
+    # check simply skips it -- its own verdict already carries the bad
+    # index.
+    previous_terminal: Optional[str] = None
+    previous_ok = False
+    for shard, verdict in zip(shards, verdicts):
+        if verdict["ok"]:
+            if previous_ok and shard["prev"] != previous_terminal:
+                flag(verdict["start"])
+            previous_terminal = _terminal_digest(shard)
+            previous_ok = True
+        else:
+            previous_ok = False
+
+    overall = _verdict(
+        verdicts[0]["tenant"],
+        verdicts[0]["start"],
+        verdicts[-1]["end"],
+        first_bad,
+    )
+    return {"overall": overall, "shards": verdicts}
+
+
+def _terminal_digest(proof: dict) -> str:
+    """The digest a verified proof's successor must link from."""
+    terminal = proof["prev"]
+    for window in proof["windows"]:
+        for item in window["records"]:
+            record = item["record"]
+            if isinstance(record, dict) and isinstance(record.get("digest"), str):
+                terminal = record["digest"]
+    return terminal
+
+
+def _corrupted_shard_verdict(proof: dict) -> dict:
+    """Corrupted verdict in the full offline-verdict shape."""
+    start = proof.get("start")
+    end = proof.get("end")
+    tenant = proof.get("tenant")
+    if not _nonneg_int(start):
+        start = 0
+    if not _nonneg_int(end) or end < start:
+        end = start
+    if not isinstance(tenant, str):
+        tenant = ""
+    return {
+        "ok": False,
+        "first_bad": start,
+        "count": end - start,
+        "start": start,
+        "end": end,
+        "tenant": tenant,
+    }
 
 
 def _same_anchor(a: dict, b: dict) -> bool:
