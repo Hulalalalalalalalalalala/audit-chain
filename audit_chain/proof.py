@@ -357,8 +357,214 @@ def verify_proofs(proofs: Any) -> list[dict]:
     return verdicts
 
 
-def _same_anchor(a: dict, b: dict) -> bool:
-    return (
+class ShardVerifier:
+    """Incremental verifier for a stream of window shards of one interval.
+
+    Shards are checked one at a time with :meth:`check`, in the order
+    they were produced; each call returns a verdict of exactly the shape
+    :func:`verify_proof` returns for that shard alone. Once every shard
+    has been checked, :meth:`finish` returns the whole-interval verdict,
+    item-wise identical to the offline verdict of a single proof
+    exported over the same interval: the shard-to-shard chain links are
+    tracked across the stream, so a break still lands on the real first
+    bad record. A tampered or malformed shard reports corruption in its
+    own verdict without affecting the other shards' verdicts, and the
+    stream keeps going in input order.
+
+    Optional ``tenant``/``start``/``end`` bind the caller's request to
+    the stream, exactly as the :func:`verify_proof` binds do. A non-dict
+    shard raises ``TypeError``; a shard that does not begin where the
+    previous one ended (a gap or an overlap), or one for a different
+    tenant, raises ``ValueError`` and is not absorbed. :meth:`finish`
+    before any shard was checked raises ``TypeError``.
+    """
+
+    def __init__(
+        self,
+        *,
+        tenant: Optional[str] = None,
+        start: Optional[int] = None,
+        end: Optional[int] = None,
+    ):
+        self._tenant = tenant
+        self._bound_start = start
+        self._bound_end = end
+        # The index the next shard must start at; None accepts the next
+        # shard's position (initial state, or resync after a malformed
+        # shard whose claimed end could not be read).
+        self._expected_next = start
+        # The digest the next shard's first record must link from, or
+        # None when the previous shard could not vouch for one.
+        self._prev_outgoing: Optional[str] = None
+        self._first_bad = -1
+        self._stream_start: Optional[int] = None
+        self._stream_end: Optional[int] = None
+        self._checked = 0
+
+    def check(self, shard: dict) -> dict:
+        """Check one shard and return its standalone verdict."""
+        if not isinstance(shard, dict):
+            raise TypeError("each shard must be a dict")
+        try:
+            verdict = verify_proof(shard)
+        except ValueError:
+            # Structurally malformed: no chain walk was possible. Report
+            # corruption at the earliest index the shard claims, keep
+            # the verdict shape, and resync the stream from whatever
+            # end the shard claims so the remaining shards still check.
+            verdict = _corrupted_shard_verdict(
+                shard, self._expected_next, self._tenant
+            )
+            self._absorb(verdict, shard, valid=False)
+            return verdict
+        if self._tenant is not None and verdict["tenant"] != self._tenant:
+            raise ValueError("shard is for a different tenant")
+        if (
+            self._expected_next is not None
+            and verdict["start"] != self._expected_next
+        ):
+            raise ValueError("shard stream has a gap or overlap")
+        self._absorb(verdict, shard, valid=True)
+        return verdict
+
+    def finish(self) -> dict:
+        """The whole-interval verdict once every shard was checked."""
+        if self._checked == 0:
+            raise TypeError("shard stream must not be empty")
+        if self._bound_start is not None and self._stream_start != self._bound_start:
+            raise ValueError("shards do not cover the bound start")
+        if self._bound_end is not None and self._stream_end != self._bound_end:
+            raise ValueError("shards do not cover the bound end")
+        return _verdict(
+            self._tenant if self._tenant is not None else "",
+            self._stream_start,
+            self._stream_end,
+            self._first_bad,
+        )
+
+    def _absorb(self, verdict: dict, shard: dict, *, valid: bool) -> None:
+        if self._tenant is None and verdict["tenant"]:
+            self._tenant = verdict["tenant"]
+        if self._stream_start is None:
+            self._stream_start = verdict["start"]
+        self._stream_end = verdict["end"]
+        if valid:
+            # Cross-shard link: the first record of this shard must link
+            # from the digest the previous shard's chain ended on, the
+            # same check a one-shot verification applies at that index.
+            if (
+                self._prev_outgoing is not None
+                and shard["prev"] != self._prev_outgoing
+            ):
+                self._flag(verdict["start"])
+            self._prev_outgoing = _proof_outgoing_digest(shard)
+            self._expected_next = verdict["end"]
+        else:
+            # A malformed shard cannot vouch for an outgoing digest, and
+            # only a readable claimed end may pin the next shard's
+            # position; otherwise the next shard resyncs the stream.
+            self._prev_outgoing = None
+            claimed_end = shard.get("end")
+            self._expected_next = claimed_end if _nonneg_int(claimed_end) else None
+        if verdict["first_bad"] != -1:
+            self._flag(verdict["first_bad"])
+        self._checked += 1
+
+    def _flag(self, index: int) -> None:
+        if self._first_bad == -1 or index < self._first_bad:
+            self._first_bad = index
+
+
+def verify_proof_stream(
+    shards: Any,
+    *,
+    tenant: Optional[str] = None,
+    start: Optional[int] = None,
+    end: Optional[int] = None,
+) -> dict:
+    """Verify a stream of window shards covering one interval.
+
+    ``shards`` is any iterable of proofs tiling one interval -- for
+    example the iterator :meth:`audit_chain.Chain.export_shards`
+    returns -- and is consumed lazily, one shard at a time. Returns
+    ``{"shards": [...], "total": {...}}``: one verdict per shard in
+    input order, then the whole-interval verdict, each in exactly the
+    shape :func:`verify_proof` returns. The total is item-wise identical
+    to the offline verdict of a single proof exported over the same
+    interval, with ``first_bad`` on the real first bad record. A
+    tampered or malformed shard yields a corrupted verdict carrying the
+    real first bad index without interrupting the remaining shards.
+
+    An empty shard stream or a non-dict element raises ``TypeError``; a
+    gap or overlap between shards raises ``ValueError``. Optional
+    ``tenant``/``start``/``end`` bind the caller's request to the
+    stream, exactly as the :func:`verify_proof` binds do.
+    """
+    if isinstance(shards, (dict, str, bytes, bytearray)):
+        raise TypeError("shards must be an iterable of proof dicts")
+    try:
+        iterator = iter(shards)
+    except TypeError:
+        raise TypeError("shards must be an iterable of proof dicts") from None
+
+    verifier = ShardVerifier(tenant=tenant, start=start, end=end)
+    verdicts = [verifier.check(shard) for shard in iterator]
+    return {"shards": verdicts, "total": verifier.finish()}
+
+
+def _proof_outgoing_digest(proof: dict) -> str:
+    """The digest a successor shard's first record must link from.
+
+    Replays the proof's own chain state with the same update rule
+    :func:`verify_proof` applies -- the digest of the last record that
+    linked and recomputed cleanly, seeded with the proof's ``prev`` --
+    so a sharded stream tracks the cross-shard links exactly the way a
+    one-shot verification of the whole interval does.
+    """
+    expected = proof["prev"]
+    for window in proof["windows"]:
+        for item in window["records"]:
+            record = item["record"]
+            try:
+                parsed = (
+                    rec.parse_line(rec.canonical_json(record))
+                    if isinstance(record, dict)
+                    else None
+                )
+            except ValueError:
+                parsed = None
+            if parsed is None:
+                continue
+            recomputed = rec.digest(parsed["prev"], parsed["payload"])
+            if parsed["prev"] == expected and parsed["digest"] == recomputed:
+                expected = parsed["digest"]
+    return expected
+
+
+def _corrupted_shard_verdict(
+    shard: dict, expected_next: Optional[int], tenant: Optional[str]
+) -> dict:
+    """Corrupted verdict for a malformed shard, in the proof-verdict shape."""
+    claimed_start = shard.get("start")
+    claimed_end = shard.get("end")
+    claimed_tenant = shard.get("tenant")
+    if not _nonneg_int(claimed_start):
+        claimed_start = expected_next if expected_next is not None else 0
+    if not _nonneg_int(claimed_end) or claimed_end < claimed_start:
+        claimed_end = claimed_start
+    if not isinstance(claimed_tenant, str):
+        claimed_tenant = tenant if tenant is not None else ""
+    return {
+        "ok": False,
+        "first_bad": claimed_start,
+        "count": claimed_end - claimed_start,
+        "start": claimed_start,
+        "end": claimed_end,
+        "tenant": claimed_tenant,
+    }
+
+
+def _same_anchor(a: dict, b: dict) -> bool:    return (
         a["name"] == b["name"] and a["size"] == b["size"] and a["sha256"] == b["sha256"]
     )
 

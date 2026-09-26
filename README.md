@@ -80,6 +80,34 @@ is equivalent to the input. A non-dict proof is `TypeError`; a malformed,
 reversed or non-verifying proof, or one whose end lies beyond the log's
 intact prefix, is `ValueError`; a missing log is `FileNotFoundError`.
 
+`Chain.export_shards(tenant, start, end, window)` streams one interval
+export as window-sized shards: the interval `[start, end)` is cut into
+consecutive shards of at most `window` records each, and every shard is an
+ordinary offline proof (verifiable with `verify_proof`, re-combinable into
+the whole-interval proof with `combine_proofs`). The shards tile the
+interval exactly — end of one is the start of the next, no gap, no overlap.
+The returned iterator produces shards lazily, so memory tracks a single
+window, never the interval length; the snapshot lock is held for the whole
+stream, so every shard describes the same complete prefix even if other
+processes append, rotate, merge or archive meanwhile. The export writes
+nothing to the store: an interrupted production leaves no temp files behind,
+and a fresh re-export yields the byte-identical shard sequence. A
+non-positive or non-integer `window`, an empty or reversed interval, and
+non-integer or out-of-bounds endpoints raise `ValueError`.
+
+`audit_chain.verify_proof_stream(shards, *, tenant=None, start=None, end=None)`
+consumes an iterable of shards (for example the iterator above) and returns
+`{"shards": [...], "total": {...}}`: one verdict per shard in input order
+plus the whole-interval verdict, each in the `verify_proof` verdict shape.
+The total is item-wise identical to the offline verdict of a single export
+over the same interval, with `first_bad` on the real first bad record; a
+tampered or malformed shard yields a corrupted verdict without interrupting
+the remaining shards. An empty shard stream or a non-dict element raises
+`TypeError`; a gap or overlap between shards raises `ValueError`.
+`audit_chain.ShardVerifier(tenant=..., start=..., end=...)` is the
+incremental form: `.check(shard)` returns each shard's verdict as it is fed,
+`.finish()` returns the whole-interval verdict.
+
 ### Online archiving
 
 `archive(archive_dir)` moves every sealed segment out of the hot store
@@ -161,7 +189,10 @@ reads no others; records in sealed segments are anchored straight from the
 signed manifest material, so sealed bytes are never hashed, and records in the
 still-growing tail are anchored over small windows containing only the
 interval's own lines. A never-verified or altered store transparently falls
-back to a full ordered byte scan with identical conclusions.
+back to a full ordered byte scan with identical conclusions. Sharded export
+(`export_shards`) inherits the same cost model shard by shard: production
+memory tracks a single window, and digest work and read volume track the
+interval, never the history length.
 
 ### Crash recovery
 

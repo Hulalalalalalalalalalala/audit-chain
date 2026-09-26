@@ -8,6 +8,21 @@ independent: an entry only links to the previous entry of the same tenant.
 from __future__ import annotations
 
 from .chain import Chain
-from .proof import combine_proofs, extend_proof, verify_proof, verify_proofs
+from .proof import (
+    ShardVerifier,
+    combine_proofs,
+    extend_proof,
+    verify_proof,
+    verify_proof_stream,
+    verify_proofs,
+)
 
-__all__ = ["Chain", "combine_proofs", "extend_proof", "verify_proof", "verify_proofs"]
+__all__ = [
+    "Chain",
+    "ShardVerifier",
+    "combine_proofs",
+    "extend_proof",
+    "verify_proof",
+    "verify_proof_stream",
+    "verify_proofs",
+]

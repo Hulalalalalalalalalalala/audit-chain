@@ -36,6 +36,12 @@ semantics:
 * ``export_range`` produces an offline proof for a contiguous index
   interval: only the interval's records plus the window anchors needed to
   attach the chain, verifiable with the public digest alone;
+* ``export_shards`` streams one interval export as window-sized shards:
+  each shard is an ordinary offline proof, the shards tile the interval
+  exactly (end of one is the start of the next), and they are produced
+  lazily under one snapshot lock, so memory tracks a single window and
+  every shard describes the same complete prefix even if other
+  processes append, rotate, merge or archive meanwhile;
 * ``extend_proof`` continues an exported proof to the current complete
   prefix: only the records appended after the proof's end are read and
   chained, and the increment is spliced on with ``combine_proofs``, so
@@ -50,7 +56,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import os
-from typing import Any, Optional
+from typing import Any, Iterator, Optional
 
 from . import record as rec
 from . import storage as st
@@ -1473,6 +1479,141 @@ class Chain:
         return pf.build_proof(material)
 
     # ------------------------------------------------------------------
+    # Sharded (windowed) interval export, streamed shard by shard
+    # ------------------------------------------------------------------
+
+    def export_shards(
+        self, tenant: str, start: int, end: int, window: int
+    ) -> "_ShardStream":
+        """Stream the export of ``[start, end)`` as window-sized shards.
+
+        The interval is cut into consecutive shards of at most ``window``
+        records each (the last shard carries the remainder); every shard
+        is an ordinary version-1 offline proof, exactly what
+        :meth:`export_range` produces for its sub-interval, verifiable
+        with :func:`audit_chain.proof.verify_proof` and re-combinable
+        into the whole-interval proof with
+        :func:`audit_chain.proof.combine_proofs`. The shards tile the
+        interval exactly: indices are contiguous from ``start`` to
+        ``end`` with no gap and no overlap.
+
+        The returned iterator produces shards lazily, one window at a
+        time, so memory tracks a single window rather than the interval
+        length; with a warm, authenticated verify cache only the units
+        covering the interval are opened and no sealed byte is hashed,
+        so digest work and read volume track the interval, never the
+        total history length (a cold store transparently falls back to
+        one ordered counting scan plus the bounded collection, with
+        identical shards). The snapshot lock is taken at call time and
+        held until the stream is exhausted, closed or collected: a
+        concurrent append, rotation, merge or archive migration blocks
+        meanwhile, so every shard describes the same complete prefix --
+        never a mixed topology and never a skipped index. The stream is
+        a context manager; closing it releases the snapshot early.
+
+        The export writes nothing to the store: an interrupted
+        production leaves no temp files or half-built state in the
+        store directory, and a fresh re-export of the same interval and
+        window yields the byte-identical shard sequence.
+
+        A non-positive or non-integer ``window``, an empty or reversed
+        interval, and non-integer, negative or out-of-bounds endpoints
+        all raise ``ValueError``.
+        """
+        if not isinstance(window, int) or isinstance(window, bool) or window <= 0:
+            raise ValueError("window must be a positive integer")
+        if (
+            not isinstance(start, int)
+            or not isinstance(end, int)
+            or isinstance(start, bool)
+            or isinstance(end, bool)
+        ):
+            raise ValueError("range bounds must be integers")
+        if start < 0 or end < 0:
+            raise ValueError("range bounds must be non-negative")
+        if end < start:
+            raise ValueError("range is reversed: start must be <= end")
+        if start == end:
+            raise ValueError("range must be a non-empty interval")
+
+        # Take the snapshot lock at call time: bounds are validated
+        # eagerly against the same complete prefix the lazy production
+        # will read, and the lock is released when the returned stream
+        # is exhausted or closed.
+        locked = self._locked(exclusive=False)
+        layout = locked.__enter__()
+        try:
+            if layout.kind == "file" and not os.path.exists(layout.root):
+                raise ValueError("range is out of bounds for an empty history")
+            units = self._snapshot_units(layout, tolerate_metadata=True)
+            counts = self._export_guide(units, layout, tenant)
+            if counts is None:
+                # Cold store: derive each unit's cumulative tenant count
+                # from one ordered scan, then collect with the same
+                # bounded path the warm cache guides.
+                counts = self._count_units(units, tenant)
+            total = counts[-1]
+            if total == 0:
+                raise ValueError("range is out of bounds for an empty history")
+            if start >= total or end > total:
+                raise ValueError("range is out of bounds")
+            generator = self._produce_shards(
+                units, tenant, start, end, counts, window
+            )
+            return _ShardStream(locked, generator)
+        except BaseException:
+            locked.__exit__(None, None, None)
+            raise
+
+    def _produce_shards(
+        self,
+        units: list[dict],
+        tenant: str,
+        start: int,
+        end: int,
+        counts: list[int],
+        window: int,
+    ) -> Iterator[dict]:
+        """Yield one built proof per shard, in interval order."""
+        from . import proof as pf
+
+        for material in self._collect_shards_bounded(
+            units, tenant, start, end, counts, window
+        ):
+            yield pf.build_proof(material)
+
+    def _count_units(self, units: list[dict], tenant: str) -> list[int]:
+        """Cumulative tenant record counts per unit, from one ordered scan.
+
+        Cold fallback for a sharded export when no authenticated verify
+        cache can guide the read. Records are counted exactly the way
+        the range collector counts them -- complete newline-terminated
+        lines only, malformed lines and a crashed half-written tail
+        skipped -- with no digest work and no retained records.
+        """
+        counts: list[int] = []
+        total = 0
+        for unit in units:
+            try:
+                with open(unit["path"], "rb") as handle:
+                    raw = handle.read()
+            except FileNotFoundError:
+                if not unit["sealed"]:
+                    counts.append(total)
+                    continue
+                raise
+            for line_raw in raw.split(b"\n")[:-1]:
+                try:
+                    record = st.decode_records(line_raw + b"\n")[0]
+                except ValueError:
+                    continue
+                if record["tenant"] == tenant:
+                    total += 1
+            counts.append(total)
+        return counts
+
+
+    # ------------------------------------------------------------------
     # Small helpers
     # ------------------------------------------------------------------
 
@@ -1677,11 +1818,46 @@ class Chain:
         if start >= total or end > total:
             raise ValueError("range is out of bounds")
 
+        # A one-shot export is the degenerate sharded collection: a
+        # single window covering the whole interval.
+        return next(
+            iter(
+                self._collect_shards_bounded(
+                    units, tenant, start, end, counts, end - start
+                )
+            )
+        )
+
+    def _collect_shards_bounded(
+        self,
+        units: list[dict],
+        tenant: str,
+        start: int,
+        end: int,
+        counts: list[int],
+        window: int,
+    ) -> Iterator[dict]:
+        """Yield shard materials for ``[start, end)`` in window-sized pieces.
+
+        One ordered pass over the covering units: each unit is opened at
+        most once and only the current shard's records are retained, so
+        memory tracks a single window, never the interval or the
+        history. Anchoring is exactly the bounded exporter's -- manifest
+        windows for preserved sealed bytes, narrowed runs of consecutive
+        interval lines in a growing tail -- so a shard boundary landing
+        inside a preserved window carries the same anchor on both sides
+        and :func:`audit_chain.proof.combine_proofs` merges the two
+        halves back into one window.
+        """
+        total = counts[-1]
         first_unit = self._first_unit_for(counts, start)
         last_unit = self._first_unit_for(counts, end - 1)
 
-        # Emitted windows in physical order; seqs are assigned at the end so
-        # the cross-window chain is strictly increasing.
+        # Current shard's emitted windows in physical order; seqs are
+        # assigned per shard at flush time so each shard's window chain
+        # is strictly increasing from zero.
+        shard_start = start
+        shard_end = min(start + window, end)
         emitted: list[dict] = []
         sealed_index: dict[tuple[int, int], int] = {}
         predecessor: Optional[str] = None
@@ -1697,11 +1873,11 @@ class Chain:
             for part in parts:
                 running += part["size"]
                 window_ends.append(running)
-            tail_offset = running
 
-            # Pending narrowed tail window: [blob, slots]. It holds one run
-            # of physically consecutive interval lines, so its bytes contain
-            # only interval records -- no other-tenant or out-of-range line.
+            # Pending narrowed tail window: [blob, slots]. It holds one
+            # run of physically consecutive interval lines, so its bytes
+            # contain only interval records -- no other-tenant or
+            # out-of-range line.
             run: Optional[list] = None
             prev_tail_end: Optional[int] = None
             base = counts[ui - 1] if ui else 0
@@ -1733,9 +1909,9 @@ class Chain:
                 except ValueError:
                     record = None
                 is_tenant = record is not None and record["tenant"] == tenant
-                included = is_tenant and start <= local < end
+                included = is_tenant and shard_start <= local < shard_end
 
-                if is_tenant and local == start:
+                if is_tenant and local == shard_start:
                     predecessor = record["prev"]
 
                 if included:
@@ -1784,29 +1960,39 @@ class Chain:
 
                 if is_tenant:
                     local += 1
+                    if local == shard_end:
+                        # The shard is complete: seal it before any later
+                        # record (or unit) is touched, so only one
+                        # window's material is ever retained.
+                        flush_tail()
+                        anchors = {
+                            seq: {
+                                "name": item["name"],
+                                "size": item["size"],
+                                "sha256": item["sha256"],
+                            }
+                            for seq, item in enumerate(emitted)
+                        }
+                        material = {
+                            "tenant": tenant,
+                            "start": shard_start,
+                            "end": shard_end,
+                            "count": total,
+                            "prev": predecessor if predecessor is not None else "",
+                            "anchors": anchors,
+                            "buckets": [
+                                {"seq": seq, "records": item["records"]}
+                                for seq, item in enumerate(emitted)
+                            ],
+                        }
+                        shard_start = shard_end
+                        shard_end = min(shard_end + window, end)
+                        emitted = []
+                        sealed_index = {}
+                        predecessor = None
+                        yield material
 
             flush_tail()
-
-        anchors = {
-            seq: {
-                "name": window["name"],
-                "size": window["size"],
-                "sha256": window["sha256"],
-            }
-            for seq, window in enumerate(emitted)
-        }
-        return {
-            "tenant": tenant,
-            "start": start,
-            "end": end,
-            "count": total,
-            "prev": predecessor if predecessor is not None else "",
-            "anchors": anchors,
-            "buckets": [
-                {"seq": seq, "records": window["records"]}
-                for seq, window in enumerate(emitted)
-            ],
-        }
 
     @staticmethod
     def _first_unit_for(counts: list[int], index: int) -> int:
@@ -2084,6 +2270,60 @@ class Chain:
     def _delete_cache(self, layout: st.Layout) -> None:
         with contextlib.suppress(FileNotFoundError):
             os.remove(layout.cache_path)
+
+
+class _ShardStream:
+    """Lazy shard iterator holding the export's snapshot lock.
+
+    Returned by :meth:`Chain.export_shards`. Each ``next`` produces one
+    window-sized shard proof; the shared lock that pins the snapshot is
+    held from the ``export_shards`` call until the stream is exhausted,
+    closed or garbage collected, so every shard describes the same
+    complete prefix no matter what other processes do meanwhile. The
+    stream is its own iterator and a context manager, so a caller that
+    stops early can release the snapshot deterministically.
+    """
+
+    def __init__(self, locked: Any, generator: Iterator[dict]):
+        self._locked = locked
+        self._generator = generator
+        self._closed = False
+
+    def __iter__(self) -> "_ShardStream":
+        return self
+
+    def __next__(self) -> dict:
+        if self._closed:
+            raise StopIteration
+        try:
+            return next(self._generator)
+        except BaseException:
+            # Exhaustion or a read failure both end the snapshot.
+            self.close()
+            raise
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self._generator.close()
+        finally:
+            self._locked.__exit__(None, None, None)
+
+    def __enter__(self) -> "_ShardStream":
+        return self
+
+    def __exit__(self, *exc_info: Any) -> bool:
+        self.close()
+        return False
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            # Interpreter shutdown may have torn the lock module down.
+            pass
 
 
 def _cache_entry(
