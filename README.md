@@ -109,7 +109,7 @@ incremental form: `.check(shard)` returns each shard's verdict as it is fed,
 `.finish()` returns the whole-interval verdict.
 
 `Chain.export_shards_dir(tenant, start, end, window, directory)` persists
-the same windowed export as a shard directory: one file per shard
+one windowed export as a shard directory: one file per shard
 (`shard-00000000.json`, ...), each byte-identical to the corresponding
 in-memory shard, plus a self-authenticating `manifest.json` — one compact
 JSON line with a trailing newline, recording in shard order every shard's
@@ -117,13 +117,28 @@ file name, index interval and byte sha256. It returns `{"shards": n}` with
 `n` the number of completely persisted shards. Every file is committed
 with a temp-file write + fsync + atomic rename and the manifest is
 re-committed as each shard lands, so a process killed in any commit
-window leaves the directory at the old or the new committed state. Calling
-it again on the same directory resumes the export: shards the manifest
-already vouches for are authenticated in place and never rewritten, only
-the missing ones are produced. A target that is not a directory, an
-unparseable or tampered manifest, a manifest describing a different
-export, or an existing shard that does not match the manifest raises
-`ValueError`; argument type errors raise `TypeError`.
+window leaves the directory at the old or the new committed state.
+Calling it again on the same directory resumes the export and, when the
+log has kept appending, incrementally extends it: `end` may advance past
+the manifest's current end (the other identity fields — tenant, start
+and window — stay fixed), the new shards continue the existing final
+shard end-to-start — shard `i` keeps covering exactly the interval it was
+written with, so an existing shard is never rewritten — and tile the
+range from the old shard end to `end`, the complete prefix at the moment
+of the read, with no gap, overlap or skipped index. Only the missing
+shards are produced; the shards the manifest already vouches for are
+cross-checked at the manifest level alone (name, interval and recorded
+digest — their bytes are neither read nor re-hashed), so read volume and
+digest work track only the missing increment. A shard file the manifest
+names but that has vanished is reproduced from the log. The manifest is
+re-committed as each shard lands, and staging temp files and
+unreferenced orphan shards left by a killed commit are reaped. Several
+processes resuming or extending one directory serialize on one directory
+lock (in addition to the log's snapshot lock). A target that is not a
+directory, an unparseable or tampered manifest, a manifest describing a
+different export (tenant, start or window), or an `end` before the
+manifest's current end raises `ValueError`; argument type errors raise
+`TypeError`.
 
 `audit_chain.open_shard(directory, index)` reads one shard back out of a
 shard directory for offline verification: it authenticates the shard
@@ -220,8 +235,10 @@ back to a full ordered byte scan with identical conclusions. Sharded export
 (`export_shards`) inherits the same cost model shard by shard: production
 memory tracks a single window, and digest work and read volume track the
 interval, never the history length. Persisting the shards
-(`export_shards_dir`) keeps that model: a resumed export reads only the
-missing increment, and `open_shard` reads only the shard it returns.
+(`export_shards_dir`) keeps that model: a resumed or incrementally
+extended export checks the existing shards at the manifest level and
+reads/hashes only the missing increment, and `open_shard` reads only
+the shard it returns.
 
 ### Crash recovery
 

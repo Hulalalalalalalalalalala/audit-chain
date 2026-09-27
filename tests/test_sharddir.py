@@ -437,8 +437,14 @@ class ExportShardsDirErrorTest(ShardDirCase):
         self.chain.export_shards_dir("t", 0, 6, 2, self._dir())
         with open(os.path.join(self._dir(), "shard-00000001.json"), "wb") as fh:
             fh.write(b"rewritten behind the manifest")
+        # A resume only cross-checks the manifest (name, interval and the
+        # recorded digest): the vouched-for shard bytes are not re-read or
+        # re-hashed, so the resume itself completes. The tamper is caught
+        # where the shard is actually consumed: open_shard authenticates
+        # the bytes against the manifest and raises ValueError.
+        self.chain.export_shards_dir("t", 0, 6, 2, self._dir())
         with self.assertRaises(ValueError):
-            self.chain.export_shards_dir("t", 0, 6, 2, self._dir())
+            open_shard(self._dir(), 1)
 
 
 class OpenShardTest(ShardDirCase):

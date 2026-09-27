@@ -1,4 +1,4 @@
-"""On-disk shard directories: a persisted, resumable window-sharded export.
+"""On-disk shard directories: a persisted, resumable, incremental export.
 
 A shard directory holds one file per shard -- ``shard-00000000.json``,
 ``shard-00000001.json``, ... -- where each file's bytes are exactly the
@@ -8,13 +8,24 @@ by a single newline, recording in shard order every shard's file name,
 index interval and the sha256 of its file bytes, sealed by an
 authentication tag over the whole manifest.
 
+The directory describes one growing prefix ``[start, end)`` of one
+tenant, tiled into consecutive shards of at most ``window`` records.
+The tiling is a plain contiguous chain of entries -- each entry begins
+exactly where the previous one ended, every one but the last spans a
+full window and the last carries the remainder -- so when the log keeps
+appending and another export call advances ``end``, the new shards
+continue end-to-start right after the existing final shard. The
+existing final shard is byte-stable (it keeps covering exactly the
+records it was written with); only the newly missing shards are
+produced, and the manifest is re-committed as each one lands. Shards
+the manifest already vouches for are checked at the manifest level
+(name, interval, recorded digest) without re-reading or re-hashing
+their bytes.
+
 Every file is committed with a temp-file write + fsync + atomic rename
 and the manifest is re-committed as each shard lands, so a process
 killed in any commit window leaves the directory at either the old or
-the new committed state -- never a half-written shard. A later export
-call on the same directory resumes from the committed manifest: shards
-the manifest vouches for are authenticated in place and never rewritten,
-only the missing ones are produced.
+the new committed state -- never a half-written shard.
 """
 
 from __future__ import annotations
@@ -46,7 +57,7 @@ def shard_count(start: int, end: int, window: int) -> int:
 
 
 def shard_slot(start: int, end: int, window: int, index: int) -> tuple[int, int]:
-    """The index interval shard ``index`` of the tiling must cover."""
+    """The index interval shard ``index`` of a full tiling must cover."""
     lo = start + index * window
     return lo, min(lo + window, end)
 
@@ -128,6 +139,83 @@ def reap_temp_files(directory: str) -> None:
                 os.remove(os.path.join(directory, name))
 
 
+def reap_orphan_shards(directory: str, entries: list[dict]) -> None:
+    """Remove shard files the committed manifest does not vouch for.
+
+    A process killed between a shard-file rename and the manifest
+    commit that names it leaves the bytes staged but unreferenced; they
+    are inert (a shard is only reachable through the manifest) and are
+    reaped here so a later resume or extend never carries half-built
+    state. A name the manifest lists is never removed.
+    """
+    referenced = {entry["name"] for entry in entries}
+    for name in os.listdir(directory):
+        if name in referenced:
+            continue
+        if name.startswith(SHARD_PREFIX) and name.endswith(SHARD_SUFFIX):
+            with contextlib.suppress(OSError):
+                os.remove(os.path.join(directory, name))
+
+
+def expected_manifest(
+    tenant: str, start: int, end: int, window: int, entries: list[dict]
+) -> dict:
+    """Assemble the manifest body describing a prefix tiled by ``entries``."""
+    return {
+        "version": MANIFEST_VERSION,
+        "tenant": tenant,
+        "start": start,
+        "end": end,
+        "window": window,
+        "shards": [dict(entry) for entry in entries],
+    }
+
+
+def manifest_tiled_end(manifest: dict) -> int:
+    """The prefix end the committed shard entries actually tile to."""
+    entries = manifest["shards"]
+    return manifest["start"] if not entries else entries[-1]["end"]
+
+
+def check_entries(
+    start: int, window: int, entries: Any, *, declared_end: int
+) -> bool:
+    """Validate the committed entries as one contiguous window tiling.
+
+    The entries must begin at ``start``, each begin exactly where the
+    previous one ended, and span between one and ``window`` records. A
+    grown directory keeps the remainder shard of every earlier append
+    cycle (a later cycle starts its own window grid right at the prior
+    tiling end), so a short entry may appear in the middle as well as
+    at the end: contiguity plus the window cap is the whole shape.
+    File names are the fixed ``shard-NNNNNNNN.json`` sequence, every
+    digest is 64 hex chars, and the tiled prefix may lag (a checkpoint)
+    but never overshoot the declared interval end.
+    """
+    if not isinstance(entries, list):
+        return False
+    cursor = start
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            return False
+        lo, hi = entry.get("start"), entry.get("end")
+        if not (_nonneg_int(lo) and _nonneg_int(hi)):
+            return False
+        if lo != cursor or hi <= lo or hi - lo > window:
+            return False
+        if entry.get("name") != shard_name(index):
+            return False
+        sha = entry.get("sha256")
+        if not (
+            isinstance(sha, str)
+            and len(sha) == 64
+            and all(char in _HEX64 for char in sha)
+        ):
+            return False
+        cursor = hi
+    return cursor <= declared_end
+
+
 def open_shard(directory: Any, index: Any) -> dict:
     """Read one shard back out of a shard directory, offline.
 
@@ -206,28 +294,15 @@ def _valid_manifest(manifest: Any) -> bool:
     if not start < end:
         return False
     shards = manifest.get("shards")
-    if not isinstance(shards, list):
+    if not isinstance(shards, list) or not shards:
         return False
-    # The entries are a prefix of the interval's tiling: a shorter list
-    # is a committed checkpoint of an interrupted export, a longer one
-    # can never have been written by an exporter of this interval.
-    if len(shards) > shard_count(start, end, window):
+    if not check_entries(start, window, shards, declared_end=end):
         return False
-    for index, entry in enumerate(shards):
-        if not isinstance(entry, dict):
-            return False
-        lo, hi = shard_slot(start, end, window, index)
-        if entry.get("name") != shard_name(index):
-            return False
-        if entry.get("start") != lo or entry.get("end") != hi:
-            return False
-        sha = entry.get("sha256")
-        if (
-            not isinstance(sha, str)
-            or len(sha) != 64
-            or any(char not in _HEX64 for char in sha)
-        ):
-            return False
+    # The committed entries tile a prefix that may lag the declared
+    # interval (a checkpoint of an interrupted export) but can never
+    # overshoot it. A grown directory keeps its earlier remainder shard,
+    # so the entry count need not equal the fresh-tiling formula: the
+    # contiguous-chain shape above is the whole definition.
     return isinstance(manifest.get("tag"), str)
 
 

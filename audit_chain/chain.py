@@ -46,7 +46,12 @@ semantics:
   directory -- one file per shard plus a self-authenticating manifest,
   committed with temp-file writes and atomic renames -- so an
   interrupted export resumes where it stopped (complete shards are
-  never rewritten) and any single shard can be read back offline with
+  checked at the manifest level and never rewritten, only missing
+  shards are produced), and a later call after the log kept appending
+  incrementally extends the directory: new shards continue the
+  existing final shard end-to-start up to the current complete prefix,
+  serialized with other writers by one directory lock; any single
+  shard can be read back offline with
   ``audit_chain.open_shard``;
 * ``extend_proof`` continues an exported proof to the current complete
   prefix: only the records appended after the proof's end are read and
@@ -81,6 +86,10 @@ _DEFAULT_MAX_SEGMENTS = 2
 # Present in the store directory while an archive migration is in flight;
 # left behind only by a killed migration and cleared by the next healer.
 _ARCHIVE_MARKER = ".archiving"
+# Serializes concurrent resumes/appends against one shard directory. It is
+# a sibling of the shard files, never matches the staging-temp name shape,
+# and is left in place like the log's own lock.
+_SHARD_DIR_LOCK = ".shard-dir.lock"
 
 
 class Chain:
@@ -1638,23 +1647,35 @@ class Chain:
         JSON of the in-memory shard. Alongside the shards a
         self-authenticating ``manifest.json`` -- one compact JSON line
         with a trailing newline -- records in shard order every shard's
-        file name, index interval and byte sha256. Returns
-        ``{"shards": n}`` with ``n`` the number of completely persisted
-        shards.
+        file name, index interval and byte sha256. The returned
+        ``{"shards": n}`` counts the completely persisted shards.
 
-        Every file is committed with a temp-file write + fsync + atomic
-        rename and the manifest is re-committed as each shard lands, so
-        a process killed in any commit window leaves the directory at
-        the old or the new committed state, never a half-written shard.
-        Calling this again on the same directory is a resumable
-        continuation: shards the manifest already vouches for are
-        authenticated in place and never rewritten, and only the
-        missing ones are produced, so read volume, digest work and
-        memory track a single window plus the increment, never the
-        history length. The restored directory splices back into the
-        whole-interval conclusion with
-        :func:`audit_chain.proof.combine_proofs` /
-        :func:`audit_chain.proof.verify_proof_stream`, item-wise
+        Calling the entry point again on the same directory is both a
+        resumable continuation and an incremental append. When the log
+        has kept appending, the requested ``end`` may advance past the
+        manifest's current end: the new shards continue the existing
+        ones end-to-start (shard ``i`` always covers the same index
+        interval of the fixed ``[start, ...)`` tiling, so an existing
+        shard file is byte-stable and is never rewritten), tiling the
+        range from the old prefix's last shard end to ``end`` -- the
+        tenant's complete prefix at the read moment as long as ``end``
+        is its record count then -- with no gap, overlap or skipped
+        index. Shards the manifest already vouches for are checked at
+        the manifest level alone (name, interval, recorded digest);
+        their bytes are neither read nor re-hashed, so read volume and
+        digest work track only the missing increment. A shard file the
+        manifest names but that is absent is simply re-produced. The
+        manifest is re-committed as each shard lands (its declared end
+        advancing with the tiled prefix), and staging temp files and
+        unreferenced orphan shards left by a killed commit are reaped.
+
+        Concurrent resumes or appends against one directory by several
+        processes serialize on one directory lock; the per-call log
+        reads run under the log's snapshot lock. A process killed in
+        any commit window leaves the directory at the old committed
+        prefix or a complete new one -- a shard file is only ever
+        reachable through the manifest that names it -- so reopening
+        and calling again completes the export with conclusions
         identical to a one-shot export of the same interval.
 
         A non-positive or non-integer ``window``, an empty or reversed
@@ -1662,8 +1683,10 @@ class Chain:
         raise ``ValueError``; a non-string ``tenant`` or a non-path
         ``directory`` raises ``TypeError``. A target that exists but is
         not a directory, an unparseable or tampered manifest, a
-        manifest describing a different export, and an existing shard
-        whose bytes do not match the manifest all raise ``ValueError``.
+        manifest describing a different export (tenant, start or
+        window), an ``end`` before the manifest's current end, and an
+        existing shard whose manifest entry is inconsistent with the
+        tiling all raise ``ValueError``.
         """
         from . import sharddir as sd
 
@@ -1693,89 +1716,204 @@ class Chain:
 
         if os.path.normpath(directory) == os.path.normpath(os.fspath(self.path)):
             raise ValueError("shard directory must differ from the log")
-        if os.path.exists(directory):
-            if not os.path.isdir(directory):
-                raise ValueError("shard export target is not a directory")
-        else:
+        fresh = not os.path.exists(directory)
+        if not fresh and not os.path.isdir(directory):
+            raise ValueError("shard export target is not a directory")
+        if fresh:
             # Validate the range against the log before anything is
             # created on disk, so a rejected export leaves no trace.
             self.export_shards(tenant, start, end, window).close()
-            os.makedirs(directory)
-        # A killed commit may leave its staging temp file behind; reap it
-        # so the directory holds only committed files.
+            os.makedirs(directory, exist_ok=True)
+            if not os.path.isdir(directory):
+                raise ValueError("shard export target is not a directory")
+
+        lock_path = os.path.join(directory, _SHARD_DIR_LOCK)
+        with st.file_lock(lock_path, timeout=self.lock_timeout, shared=False):
+            return self._export_shards_dir_locked(
+                sd, tenant, start, end, window, directory
+            )
+
+    def _export_shards_dir_locked(
+        self,
+        sd: Any,
+        tenant: str,
+        start: int,
+        end: int,
+        window: int,
+        directory: str,
+    ) -> dict:
+        """The resume/extend body, running with the directory lock held."""
+        if not os.path.isdir(directory):
+            raise ValueError("shard export target is not a directory")
+        # A killed commit may leave staging temp files (a half-written
+        # shard or a superseded manifest) behind; reap them so the
+        # directory holds only committed files.
         sd.reap_temp_files(directory)
 
-        total = sd.shard_count(start, end, window)
-        entries: list[dict] = []
-        if os.path.exists(os.path.join(directory, sd.MANIFEST_NAME)):
+        manifest_path = os.path.join(directory, sd.MANIFEST_NAME)
+        if os.path.exists(manifest_path):
             existing = sd.load_manifest(directory)
             if (
                 existing["tenant"] != tenant
                 or existing["start"] != start
-                or existing["end"] != end
                 or existing["window"] != window
             ):
                 raise ValueError(
                     "existing shard manifest describes a different export"
                 )
-            entries = existing["shards"]
+            declared = existing["end"]
+            if end < declared:
+                # An export can never shrink or overwrite the prefix the
+                # directory already covers.
+                raise ValueError(
+                    "existing shard manifest describes a different export"
+                )
+            entries = [dict(item) for item in existing["shards"]]
+            # The manifest's own tag authenticates the recorded digests;
+            # the entries must be one contiguous tiling whose final shard
+            # ends no later than the declared interval. Vouched-for shard
+            # bytes are neither read nor re-hashed here.
+            if not sd.check_entries(
+                start, window, entries, declared_end=declared
+            ):
+                raise ValueError("shard manifest does not match its export")
+            tiled_end = sd.manifest_tiled_end(existing)
+        else:
+            declared = start
+            entries = []
+            tiled_end = start
 
-        # Authenticate every shard the manifest vouches for: a vouched
-        # shard whose bytes were rewritten is corruption, while a
-        # missing one is simply re-produced below.
-        missing: list[int] = []
-        for index, entry in enumerate(entries):
-            if not os.path.exists(os.path.join(directory, entry["name"])):
-                missing.append(index)
-                continue
-            if sd.file_digest(os.path.join(directory, entry["name"])) != entry[
-                "sha256"
-            ]:
-                raise ValueError("existing shard does not match the manifest")
+        missing = [
+            index
+            for index, entry in enumerate(entries)
+            if not os.path.exists(os.path.join(directory, entry["name"]))
+        ]
+        if tiled_end == end and not missing:
+            # The committed manifest already tiles the whole requested
+            # prefix and every shard file is present: a manifest-level
+            # check only -- no shard bytes, no manifest re-commit and no
+            # log read at all.
+            return {"shards": len(entries)}
 
-        needed = sorted(missing + list(range(len(entries), total)))
-        if not needed:
-            # The committed manifest already vouches for every shard.
-            return {"shards": total}
+        # New shards continue the committed tiling exactly where its
+        # final shard ended: a previously partial remainder shard stays
+        # byte-stable, and the next full window begins right after it.
+        appended = 0 if end <= tiled_end else -(-(end - tiled_end) // window)
+        new_total = len(entries) + appended
 
-        entries = [dict(entry) for entry in entries]
-        manifest = {
-            "version": sd.MANIFEST_VERSION,
-            "tenant": tenant,
-            "start": start,
-            "end": end,
-            "window": window,
-            "shards": entries,
-        }
-        # Produce only the missing shards, one contiguous run at a time;
-        # each run is one snapshot stream, so log reads track the
-        # increment and memory tracks a single window.
-        for run_start, run_end in _index_runs(needed):
-            lo = start + run_start * window
-            hi = min(start + run_end * window, end)
-            with self.export_shards(tenant, lo, hi, window) as stream:
+        # Reap unreferenced shard files (a staged rename a killed commit
+        # never got its manifest to name) before any new shard is
+        # produced; they can never be reached except through a manifest
+        # entry, so this removes no committed state.
+        sd.reap_orphan_shards(directory, entries)
+
+        # Only an actual extension needs the log: one read pins the
+        # complete prefix this call tiles to, and the shard stream below
+        # takes its own snapshot of that prefix, so concurrent appenders,
+        # rotations, merges or archive migrations never mix a count or
+        # topology into the middle of this export. A pure refill opens
+        # only the exact ranges it reproduces.
+        if appended:
+            _counts, total = self._tenant_snapshot_counts(tenant)
+            if end > total:
+                raise ValueError("range is out of bounds")
+
+        # Refill named entries whose shard file vanished. Each slot is
+        # fixed by the committed manifest (a fossilized remainder shard
+        # need not sit on a window-grid boundary), so each one is
+        # reproduced as the single-shard range export of exactly its
+        # recorded interval; the interval's records are stable across
+        # rotation, compaction and archiving. When only the physical
+        # anchoring changed (bytes grew into a sealed segment since the
+        # first write), the new digest is committed *before* the file is
+        # renamed in: a kill in between leaves a committed manifest
+        # naming an absent shard, which a later call refills exactly the
+        # way an interrupted export resumes -- never a present file
+        # whose bytes disagree with the manifest.
+        for index in missing:
+            record_entry = entries[index]
+            shard = self.export_range(
+                tenant, record_entry["start"], record_entry["end"]
+            )
+            raw = sd.shard_bytes(shard)
+            digest = hashlib.sha256(raw).hexdigest()
+            if digest != record_entry["sha256"]:
+                entries[index] = {
+                    "name": record_entry["name"],
+                    "start": record_entry["start"],
+                    "end": record_entry["end"],
+                    "sha256": digest,
+                }
+                manifest = sd.expected_manifest(
+                    tenant, start, declared, window, entries
+                )
+                sd.save_manifest(directory, manifest)
+            # Identical bytes land with no manifest change: either side
+            # of the rename is one consistent committed state.
+            sd.write_shard(directory, record_entry["name"], raw)
+
+        # The incremental append: one snapshot stream from the
+        # committed tiling's end to the requested prefix end. The
+        # stream's windowing matches this run's slots exactly (both
+        # start at tiled_end), so each yielded shard is the next entry.
+        if appended:
+            base = len(entries)
+            with self.export_shards(tenant, tiled_end, end, window) as stream:
                 for offset, shard in enumerate(stream):
-                    index = run_start + offset
+                    index = base + offset
+                    lo = tiled_end + offset * window
+                    hi = min(lo + window, end)
+                    if shard["start"] != lo or shard["end"] != hi:
+                        raise ValueError(
+                            "shard export does not tile the prefix"
+                        )
                     raw = sd.shard_bytes(shard)
                     name = sd.shard_name(index)
                     sd.write_shard(directory, name, raw)
-                    entry = {
-                        "name": name,
-                        "start": shard["start"],
-                        "end": shard["end"],
-                        "sha256": hashlib.sha256(raw).hexdigest(),
-                    }
-                    if index < len(entries):
-                        if entries[index] == entry:
-                            continue
-                        entries[index] = entry
-                    else:
-                        entries.append(entry)
-                    # Commit the checkpoint before the next shard: a kill
-                    # lands on the old or the new manifest, and a later
-                    # call resumes from exactly here.
+                    entries.append(
+                        {
+                            "name": name,
+                            "start": lo,
+                            "end": hi,
+                            "sha256": hashlib.sha256(raw).hexdigest(),
+                        }
+                    )
+                    # Commit after each shard with the declared end
+                    # advanced to the prefix it completes: every
+                    # checkpoint manifest is a complete, self-consistent
+                    # export, so a kill lands on the old or the new
+                    # committed prefix, never on a half tiling.
+                    declared = hi
+                    manifest = sd.expected_manifest(
+                        tenant, start, declared, window, entries
+                    )
                     sd.save_manifest(directory, manifest)
-        return {"shards": total}
+        # The final shard lands exactly on the requested interval, so
+        # the declared end already equals it; sweep any orphan a
+        # kill-free run could still have left behind.
+        sd.reap_orphan_shards(directory, entries)
+        st.fsync_dir(directory)
+        return {"shards": new_total}
+
+    def _tenant_snapshot_counts(self, tenant: str) -> tuple[list[int], int]:
+        """Cumulative tenant record counts per unit under one snapshot lock.
+
+        Returns ``(counts, total)`` where ``counts[i]`` is the tenant's
+        cumulative record count after unit ``i`` and ``total`` is the
+        count at the read moment. With a warm, authenticated verify
+        cache only sidecar material is read; a cold store falls back to
+        one ordered counting scan. Mirrors exactly the snapshot
+        :meth:`export_shards` takes, so a directory export tiles the
+        same complete prefix the in-memory shard stream would.
+        """
+        with self._locked(exclusive=False) as layout:
+            if layout.kind == "file" and not os.path.exists(layout.root):
+                return [0], 0
+            units = self._snapshot_units(layout, tolerate_metadata=True)
+            counts = self._export_guide(units, layout, tenant)
+            if counts is None:
+                counts = self._count_units(units, tenant)
+        return counts, counts[-1]
 
 
     # ------------------------------------------------------------------
@@ -2577,18 +2715,6 @@ def _iter_complete_lines(path: str) -> Iterator[bytes]:
             if not line.endswith(b"\n"):
                 return
             yield line
-
-
-def _index_runs(indices: list[int]) -> Iterator[tuple[int, int]]:
-    """Group a sorted index list into contiguous ``[start, end)`` runs."""
-    run_start = previous = indices[0]
-    for index in indices[1:]:
-        if index == previous + 1:
-            previous = index
-            continue
-        yield run_start, previous + 1
-        run_start = previous = index
-    yield run_start, previous + 1
 
 
 def _write_all(fd: int, data: bytes) -> None:
