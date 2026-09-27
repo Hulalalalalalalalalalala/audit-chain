@@ -108,6 +108,33 @@ the remaining shards. An empty shard stream or a non-dict element raises
 incremental form: `.check(shard)` returns each shard's verdict as it is fed,
 `.finish()` returns the whole-interval verdict.
 
+`Chain.export_shards_dir(tenant, start, end, window, directory)` persists
+the same windowed export as a shard directory: one file per shard
+(`shard-00000000.json`, ...), each byte-identical to the corresponding
+in-memory shard, plus a self-authenticating `manifest.json` — one compact
+JSON line with a trailing newline, recording in shard order every shard's
+file name, index interval and byte sha256. It returns `{"shards": n}` with
+`n` the number of completely persisted shards. Every file is committed
+with a temp-file write + fsync + atomic rename and the manifest is
+re-committed as each shard lands, so a process killed in any commit
+window leaves the directory at the old or the new committed state. Calling
+it again on the same directory resumes the export: shards the manifest
+already vouches for are authenticated in place and never rewritten, only
+the missing ones are produced. A target that is not a directory, an
+unparseable or tampered manifest, a manifest describing a different
+export, or an existing shard that does not match the manifest raises
+`ValueError`; argument type errors raise `TypeError`.
+
+`audit_chain.open_shard(directory, index)` reads one shard back out of a
+shard directory for offline verification: it authenticates the shard
+against the manifest and never opens the log or any other shard. A
+missing directory, manifest or shard file raises `FileNotFoundError`; an
+unparseable manifest or shard, a shard that does not match the manifest,
+or an out-of-range index raises `ValueError`. The shards of a directory
+splice back into the whole-interval conclusion with `combine_proofs` /
+`verify_proof_stream`, item-wise identical to a one-shot export of the
+same interval.
+
 ### Online archiving
 
 `archive(archive_dir)` moves every sealed segment out of the hot store
@@ -192,7 +219,9 @@ interval's own lines. A never-verified or altered store transparently falls
 back to a full ordered byte scan with identical conclusions. Sharded export
 (`export_shards`) inherits the same cost model shard by shard: production
 memory tracks a single window, and digest work and read volume track the
-interval, never the history length.
+interval, never the history length. Persisting the shards
+(`export_shards_dir`) keeps that model: a resumed export reads only the
+missing increment, and `open_shard` reads only the shard it returns.
 
 ### Crash recovery
 

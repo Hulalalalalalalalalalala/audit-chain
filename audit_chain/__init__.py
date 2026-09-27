@@ -16,12 +16,14 @@ from .proof import (
     verify_proof_stream,
     verify_proofs,
 )
+from .sharddir import open_shard
 
 __all__ = [
     "Chain",
     "ShardVerifier",
     "combine_proofs",
     "extend_proof",
+    "open_shard",
     "verify_proof",
     "verify_proof_stream",
     "verify_proofs",

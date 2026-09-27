@@ -42,6 +42,12 @@ semantics:
   lazily under one snapshot lock, so memory tracks a single window and
   every shard describes the same complete prefix even if other
   processes append, rotate, merge or archive meanwhile;
+* ``export_shards_dir`` persists that sharded export as a shard
+  directory -- one file per shard plus a self-authenticating manifest,
+  committed with temp-file writes and atomic renames -- so an
+  interrupted export resumes where it stopped (complete shards are
+  never rewritten) and any single shard can be read back offline with
+  ``audit_chain.open_shard``;
 * ``extend_proof`` continues an exported proof to the current complete
   prefix: only the records appended after the proof's end are read and
   chained, and the increment is spliced on with ``combine_proofs``, so
@@ -1589,28 +1595,187 @@ class Chain:
         cache can guide the read. Records are counted exactly the way
         the range collector counts them -- complete newline-terminated
         lines only, malformed lines and a crashed half-written tail
-        skipped -- with no digest work and no retained records.
+        skipped -- with no digest work and no retained records. Units
+        are read line by line, so memory tracks a single line, never
+        the history length.
         """
         counts: list[int] = []
         total = 0
         for unit in units:
             try:
-                with open(unit["path"], "rb") as handle:
-                    raw = handle.read()
+                for line in _iter_complete_lines(unit["path"]):
+                    try:
+                        record = st.decode_records(line)[0]
+                    except ValueError:
+                        continue
+                    if record["tenant"] == tenant:
+                        total += 1
             except FileNotFoundError:
                 if not unit["sealed"]:
                     counts.append(total)
                     continue
                 raise
-            for line_raw in raw.split(b"\n")[:-1]:
-                try:
-                    record = st.decode_records(line_raw + b"\n")[0]
-                except ValueError:
-                    continue
-                if record["tenant"] == tenant:
-                    total += 1
             counts.append(total)
         return counts
+
+    # ------------------------------------------------------------------
+    # Sharded interval export, persisted to a shard directory
+    # ------------------------------------------------------------------
+
+    def export_shards_dir(
+        self,
+        tenant: str,
+        start: int,
+        end: int,
+        window: int,
+        directory: Any,
+    ) -> dict:
+        """Persist the windowed export of ``[start, end)`` as a shard dir.
+
+        The interval is cut into the same consecutive shards
+        :meth:`export_shards` streams, and each shard is committed to
+        ``directory`` as one file whose bytes are exactly the canonical
+        JSON of the in-memory shard. Alongside the shards a
+        self-authenticating ``manifest.json`` -- one compact JSON line
+        with a trailing newline -- records in shard order every shard's
+        file name, index interval and byte sha256. Returns
+        ``{"shards": n}`` with ``n`` the number of completely persisted
+        shards.
+
+        Every file is committed with a temp-file write + fsync + atomic
+        rename and the manifest is re-committed as each shard lands, so
+        a process killed in any commit window leaves the directory at
+        the old or the new committed state, never a half-written shard.
+        Calling this again on the same directory is a resumable
+        continuation: shards the manifest already vouches for are
+        authenticated in place and never rewritten, and only the
+        missing ones are produced, so read volume, digest work and
+        memory track a single window plus the increment, never the
+        history length. The restored directory splices back into the
+        whole-interval conclusion with
+        :func:`audit_chain.proof.combine_proofs` /
+        :func:`audit_chain.proof.verify_proof_stream`, item-wise
+        identical to a one-shot export of the same interval.
+
+        A non-positive or non-integer ``window``, an empty or reversed
+        interval, and non-integer, negative or out-of-bounds endpoints
+        raise ``ValueError``; a non-string ``tenant`` or a non-path
+        ``directory`` raises ``TypeError``. A target that exists but is
+        not a directory, an unparseable or tampered manifest, a
+        manifest describing a different export, and an existing shard
+        whose bytes do not match the manifest all raise ``ValueError``.
+        """
+        from . import sharddir as sd
+
+        if not isinstance(tenant, str):
+            raise TypeError("tenant must be a string")
+        try:
+            directory = os.fspath(directory)
+        except TypeError:
+            raise TypeError("directory must be a path-like object") from None
+        if isinstance(directory, bytes):
+            directory = os.fsdecode(directory)
+        if not isinstance(window, int) or isinstance(window, bool) or window <= 0:
+            raise ValueError("window must be a positive integer")
+        if (
+            not isinstance(start, int)
+            or not isinstance(end, int)
+            or isinstance(start, bool)
+            or isinstance(end, bool)
+        ):
+            raise ValueError("range bounds must be integers")
+        if start < 0 or end < 0:
+            raise ValueError("range bounds must be non-negative")
+        if end < start:
+            raise ValueError("range is reversed: start must be <= end")
+        if start == end:
+            raise ValueError("range must be a non-empty interval")
+
+        if os.path.normpath(directory) == os.path.normpath(os.fspath(self.path)):
+            raise ValueError("shard directory must differ from the log")
+        if os.path.exists(directory):
+            if not os.path.isdir(directory):
+                raise ValueError("shard export target is not a directory")
+        else:
+            # Validate the range against the log before anything is
+            # created on disk, so a rejected export leaves no trace.
+            self.export_shards(tenant, start, end, window).close()
+            os.makedirs(directory)
+        # A killed commit may leave its staging temp file behind; reap it
+        # so the directory holds only committed files.
+        sd.reap_temp_files(directory)
+
+        total = sd.shard_count(start, end, window)
+        entries: list[dict] = []
+        if os.path.exists(os.path.join(directory, sd.MANIFEST_NAME)):
+            existing = sd.load_manifest(directory)
+            if (
+                existing["tenant"] != tenant
+                or existing["start"] != start
+                or existing["end"] != end
+                or existing["window"] != window
+            ):
+                raise ValueError(
+                    "existing shard manifest describes a different export"
+                )
+            entries = existing["shards"]
+
+        # Authenticate every shard the manifest vouches for: a vouched
+        # shard whose bytes were rewritten is corruption, while a
+        # missing one is simply re-produced below.
+        missing: list[int] = []
+        for index, entry in enumerate(entries):
+            if not os.path.exists(os.path.join(directory, entry["name"])):
+                missing.append(index)
+                continue
+            if sd.file_digest(os.path.join(directory, entry["name"])) != entry[
+                "sha256"
+            ]:
+                raise ValueError("existing shard does not match the manifest")
+
+        needed = sorted(missing + list(range(len(entries), total)))
+        if not needed:
+            # The committed manifest already vouches for every shard.
+            return {"shards": total}
+
+        entries = [dict(entry) for entry in entries]
+        manifest = {
+            "version": sd.MANIFEST_VERSION,
+            "tenant": tenant,
+            "start": start,
+            "end": end,
+            "window": window,
+            "shards": entries,
+        }
+        # Produce only the missing shards, one contiguous run at a time;
+        # each run is one snapshot stream, so log reads track the
+        # increment and memory tracks a single window.
+        for run_start, run_end in _index_runs(needed):
+            lo = start + run_start * window
+            hi = min(start + run_end * window, end)
+            with self.export_shards(tenant, lo, hi, window) as stream:
+                for offset, shard in enumerate(stream):
+                    index = run_start + offset
+                    raw = sd.shard_bytes(shard)
+                    name = sd.shard_name(index)
+                    sd.write_shard(directory, name, raw)
+                    entry = {
+                        "name": name,
+                        "start": shard["start"],
+                        "end": shard["end"],
+                        "sha256": hashlib.sha256(raw).hexdigest(),
+                    }
+                    if index < len(entries):
+                        if entries[index] == entry:
+                            continue
+                        entries[index] = entry
+                    else:
+                        entries.append(entry)
+                    # Commit the checkpoint before the next shard: a kill
+                    # lands on the old or the new manifest, and a later
+                    # call resumes from exactly here.
+                    sd.save_manifest(directory, manifest)
+        return {"shards": total}
 
 
     # ------------------------------------------------------------------
@@ -1864,8 +2029,6 @@ class Chain:
 
         for ui in range(first_unit, last_unit + 1):
             unit = units[ui]
-            with open(unit["path"], "rb") as handle:
-                raw = handle.read()
 
             parts = unit["parts"]
             window_ends: list[int] = []
@@ -1900,9 +2063,8 @@ class Chain:
                 )
                 run = None
 
-            for line_raw in raw.split(b"\n")[:-1]:
+            for line in _iter_complete_lines(unit["path"]):
                 line_start = pos
-                line = line_raw + b"\n"
                 pos += len(line)
                 try:
                     record = st.decode_records(line)[0]
@@ -2399,6 +2561,34 @@ def _states_from(carried: dict) -> dict:
 
 def _sha256(raw: bytes) -> str:
     return hashlib.sha256(raw).hexdigest()
+
+
+def _iter_complete_lines(path: str) -> Iterator[bytes]:
+    """Yield each complete newline-terminated line of a file, one at a time.
+
+    A trailing piece without its newline is a crashed half-written line
+    and is never a record. Memory tracks a single line, never the file.
+    """
+    with open(path, "rb") as handle:
+        while True:
+            line = handle.readline()
+            if not line:
+                return
+            if not line.endswith(b"\n"):
+                return
+            yield line
+
+
+def _index_runs(indices: list[int]) -> Iterator[tuple[int, int]]:
+    """Group a sorted index list into contiguous ``[start, end)`` runs."""
+    run_start = previous = indices[0]
+    for index in indices[1:]:
+        if index == previous + 1:
+            previous = index
+            continue
+        yield run_start, previous + 1
+        run_start = previous = index
+    yield run_start, previous + 1
 
 
 def _write_all(fd: int, data: bytes) -> None:
