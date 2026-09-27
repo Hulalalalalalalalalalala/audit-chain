@@ -13,8 +13,19 @@ and the manifest is re-committed as each shard lands, so a process
 killed in any commit window leaves the directory at either the old or
 the new committed state -- never a half-written shard. A later export
 call on the same directory resumes from the committed manifest: shards
-the manifest vouches for are authenticated in place and never rewritten,
-only the missing ones are produced.
+the manifest vouches for are checked at manifest level (presence and,
+when recorded, size) in place and never rewritten or re-hashed, only
+the missing ones are produced.
+
+The directory grows incrementally: calling the exporter again after the
+log itself grew, with the new prefix as ``end``, keeps every committed
+shard -- including a short shard at the old prefix edge -- and tiles the
+new records on from the last committed shard's end, so the manifest's
+tiling is piecewise (one window grid per extension) rather than one
+grid from ``start``. Multiple processes extending or resuming the same
+directory serialize on one per-directory lock file, and stray shards a
+killed commit left unreferenced by the manifest are reaped by the next
+lock holder.
 """
 
 from __future__ import annotations
@@ -31,6 +42,10 @@ from . import storage as st
 MANIFEST_NAME = "manifest.json"
 SHARD_PREFIX = "shard-"
 SHARD_SUFFIX = ".json"
+# Sibling dotfile lock serializing every writer (and resume reader) of one
+# shard directory across processes. It lives *inside* the directory so it is
+# created with it and reaped with it.
+LOCK_NAME = ".shards.lock"
 MANIFEST_VERSION = 1
 _CHUNK = 1 << 20
 _HEX64 = frozenset("0123456789abcdef")
@@ -38,6 +53,21 @@ _HEX64 = frozenset("0123456789abcdef")
 
 def shard_name(index: int) -> str:
     return f"{SHARD_PREFIX}{index:08d}{SHARD_SUFFIX}"
+
+
+def shard_index(name: str) -> "int | None":
+    """The shard index encoded in a ``shard-NNNNNNNN.json`` name, else None."""
+    if not (name.startswith(SHARD_PREFIX) and name.endswith(SHARD_SUFFIX)):
+        return None
+    middle = name[len(SHARD_PREFIX) : -len(SHARD_SUFFIX)]
+    if len(middle) != 8 or not middle.isdigit():
+        return None
+    return int(middle)
+
+
+def lock_path(directory: str) -> str:
+    """The per-directory lock file path."""
+    return os.path.join(directory, LOCK_NAME)
 
 
 def shard_count(start: int, end: int, window: int) -> int:
@@ -128,6 +158,22 @@ def reap_temp_files(directory: str) -> None:
                 os.remove(os.path.join(directory, name))
 
 
+def reap_orphan_shards(directory: str, manifest: dict) -> None:
+    """Remove committed shard files the manifest does not vouch for.
+
+    A kill between a shard rename and the next manifest commit leaves
+    the landed shard unreferenced. The next lock holder reproduces the
+    missing shard under the same name (the bytes are deterministic), so
+    the stray copy can simply be removed. Only canonical shard names are
+    touched; the lock file and anything unfamiliar are left alone.
+    """
+    vouched = {entry["name"] for entry in manifest["shards"]}
+    for name in os.listdir(directory):
+        if shard_index(name) is not None and name not in vouched:
+            with contextlib.suppress(OSError):
+                os.remove(os.path.join(directory, name))
+
+
 def open_shard(directory: Any, index: Any) -> dict:
     """Read one shard back out of a shard directory, offline.
 
@@ -208,18 +254,31 @@ def _valid_manifest(manifest: Any) -> bool:
     shards = manifest.get("shards")
     if not isinstance(shards, list):
         return False
-    # The entries are a prefix of the interval's tiling: a shorter list
-    # is a committed checkpoint of an interrupted export, a longer one
-    # can never have been written by an exporter of this interval.
-    if len(shards) > shard_count(start, end, window):
-        return False
+    # The entries tile a prefix of [start, end) contiguously, but the
+    # tiling is piecewise: an incremental append keeps a short shard at
+    # the old prefix edge and continues on a fresh window grid, so
+    # entry k's interval need not line up with k*window from start --
+    # it only has to meet the previous entry's end. A shorter list is a
+    # committed checkpoint of an interrupted export.
+    expected = start
     for index, entry in enumerate(shards):
         if not isinstance(entry, dict):
             return False
-        lo, hi = shard_slot(start, end, window, index)
+        lo, hi = entry.get("start"), entry.get("end")
+        if (
+            not _nonneg_int(lo)
+            or not _nonneg_int(hi)
+            or lo != expected
+            or not lo < hi
+            or hi - lo > window
+            or hi > end
+        ):
+            return False
+        expected = hi
         if entry.get("name") != shard_name(index):
             return False
-        if entry.get("start") != lo or entry.get("end") != hi:
+        size = entry.get("size")
+        if size is not None and (not _nonneg_int(size) or size == 0):
             return False
         sha = entry.get("sha256")
         if (

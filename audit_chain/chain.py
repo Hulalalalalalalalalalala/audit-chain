@@ -46,8 +46,13 @@ semantics:
   directory -- one file per shard plus a self-authenticating manifest,
   committed with temp-file writes and atomic renames -- so an
   interrupted export resumes where it stopped (complete shards are
-  never rewritten) and any single shard can be read back offline with
-  ``audit_chain.open_shard``;
+  checked at manifest level and never rewritten or re-hashed) and any
+  single shard can be read back offline with
+  ``audit_chain.open_shard``; calling it again after the log grew
+  extends the same directory, tiling the new records straight on from
+  the last committed shard's end, and concurrent callers serialize on
+  one per-directory lock so a killed process leaves the old or a fully
+  committed state;
 * ``extend_proof`` continues an exported proof to the current complete
   prefix: only the records appended after the proof's end are read and
   chained, and the increment is spliced on with ``combine_proofs``, so
@@ -1638,20 +1643,33 @@ class Chain:
         JSON of the in-memory shard. Alongside the shards a
         self-authenticating ``manifest.json`` -- one compact JSON line
         with a trailing newline -- records in shard order every shard's
-        file name, index interval and byte sha256. Returns
-        ``{"shards": n}`` with ``n`` the number of completely persisted
-        shards.
+        file name, index interval, byte size and sha256. Returns
+        ``{"shards": n}`` with ``n`` the total number of shards the
+        committed directory ends with.
 
         Every file is committed with a temp-file write + fsync + atomic
         rename and the manifest is re-committed as each shard lands, so
         a process killed in any commit window leaves the directory at
         the old or the new committed state, never a half-written shard.
-        Calling this again on the same directory is a resumable
-        continuation: shards the manifest already vouches for are
-        authenticated in place and never rewritten, and only the
-        missing ones are produced, so read volume, digest work and
-        memory track a single window plus the increment, never the
-        history length. The restored directory splices back into the
+
+        The directory extends incrementally. Calling this again after
+        the log itself kept growing, with the new complete prefix as
+        ``end``, leaves every committed shard exactly where it was -- a
+        short shard at the old prefix edge is kept, never rewritten --
+        and tiles the new records straight on from the last committed
+        shard's end to ``end``: no gap, no overlap, no renumbering.
+        Tenant, start and window must match the manifest; only end may
+        move forward. Resuming or extending never re-hashes vouched
+        shards: they are checked at manifest level only (presence and,
+        when recorded, size), so read volume and digest work track the
+        missing increment alone. Shard files left unreferenced by a
+        killed commit are reaped, as are staging temp files.
+
+        All on-disk work on one directory is serialized across
+        processes by a lock file inside the directory, so concurrent
+        resumes or appends commit one after another, and a killed
+        process leaves either the old committed state or a fully
+        committed new one. The restored directory splices back into the
         whole-interval conclusion with
         :func:`audit_chain.proof.combine_proofs` /
         :func:`audit_chain.proof.verify_proof_stream`, item-wise
@@ -1662,8 +1680,9 @@ class Chain:
         raise ``ValueError``; a non-string ``tenant`` or a non-path
         ``directory`` raises ``TypeError``. A target that exists but is
         not a directory, an unparseable or tampered manifest, a
-        manifest describing a different export, and an existing shard
-        whose bytes do not match the manifest all raise ``ValueError``.
+        manifest describing a different export (or a smaller end than
+        the committed one), and an existing shard whose recorded size
+        no longer matches all raise ``ValueError``.
         """
         from . import sharddir as sd
 
@@ -1700,82 +1719,129 @@ class Chain:
             # Validate the range against the log before anything is
             # created on disk, so a rejected export leaves no trace.
             self.export_shards(tenant, start, end, window).close()
-            os.makedirs(directory)
-        # A killed commit may leave its staging temp file behind; reap it
-        # so the directory holds only committed files.
-        sd.reap_temp_files(directory)
+            # exist_ok: a concurrent first caller may win the race to
+            # create it; both then serialize on the lock inside.
+            os.makedirs(directory, exist_ok=True)
 
-        total = sd.shard_count(start, end, window)
-        entries: list[dict] = []
-        if os.path.exists(os.path.join(directory, sd.MANIFEST_NAME)):
-            existing = sd.load_manifest(directory)
-            if (
-                existing["tenant"] != tenant
-                or existing["start"] != start
-                or existing["end"] != end
-                or existing["window"] != window
-            ):
-                raise ValueError(
-                    "existing shard manifest describes a different export"
-                )
-            entries = existing["shards"]
+        # One per-directory lock serializes every writer and resumer of
+        # this directory across processes; the commits themselves stay
+        # atomic, so a killed lock holder leaves the old manifest or a
+        # complete new one for the next holder to continue from.
+        with st.file_lock(
+            sd.lock_path(directory), timeout=self.lock_timeout, shared=False
+        ):
+            # A killed commit may leave its staging temp file behind; reap
+            # it so the directory holds only committed files.
+            sd.reap_temp_files(directory)
 
-        # Authenticate every shard the manifest vouches for: a vouched
-        # shard whose bytes were rewritten is corruption, while a
-        # missing one is simply re-produced below.
-        missing: list[int] = []
-        for index, entry in enumerate(entries):
-            if not os.path.exists(os.path.join(directory, entry["name"])):
-                missing.append(index)
-                continue
-            if sd.file_digest(os.path.join(directory, entry["name"])) != entry[
-                "sha256"
-            ]:
-                raise ValueError("existing shard does not match the manifest")
+            entries: list[dict] = []
+            if os.path.exists(os.path.join(directory, sd.MANIFEST_NAME)):
+                existing = sd.load_manifest(directory)
+                if (
+                    existing["tenant"] != tenant
+                    or existing["start"] != start
+                    or existing["window"] != window
+                    or existing["end"] > end
+                ):
+                    raise ValueError(
+                        "existing shard manifest describes a different export"
+                    )
+                entries = [dict(entry) for entry in existing["shards"]]
+                # Manifest-level check only: a vouched shard must be
+                # present and, when the manifest records its size, keep
+                # that size. Its bytes are never re-hashed here -- full
+                # authentication happens lazily in open_shard, one
+                # shard at a time.
+                missing: list[int] = []
+                for index, entry in enumerate(entries):
+                    path = os.path.join(directory, entry["name"])
+                    if not os.path.exists(path):
+                        missing.append(index)
+                        continue
+                    recorded_size = entry.get("size")
+                    if recorded_size is not None and os.path.getsize(path) != (
+                        recorded_size
+                    ):
+                        raise ValueError(
+                            "existing shard does not match the manifest"
+                        )
+            else:
+                missing = []
 
-        needed = sorted(missing + list(range(len(entries), total)))
-        if not needed:
-            # The committed manifest already vouches for every shard.
-            return {"shards": total}
+            # Landed-but-unvouched shards of a killed commit are not
+            # authenticated by any manifest; the bytes are deterministic,
+            # so reap them and produce them again under the same names.
+            sd.reap_orphan_shards(directory, {"shards": entries})
 
-        entries = [dict(entry) for entry in entries]
-        manifest = {
-            "version": sd.MANIFEST_VERSION,
-            "tenant": tenant,
-            "start": start,
-            "end": end,
-            "window": window,
-            "shards": entries,
-        }
-        # Produce only the missing shards, one contiguous run at a time;
-        # each run is one snapshot stream, so log reads track the
-        # increment and memory tracks a single window.
-        for run_start, run_end in _index_runs(needed):
-            lo = start + run_start * window
-            hi = min(start + run_end * window, end)
-            with self.export_shards(tenant, lo, hi, window) as stream:
-                for offset, shard in enumerate(stream):
-                    index = run_start + offset
-                    raw = sd.shard_bytes(shard)
-                    name = sd.shard_name(index)
-                    sd.write_shard(directory, name, raw)
-                    entry = {
-                        "name": name,
-                        "start": shard["start"],
-                        "end": shard["end"],
-                        "sha256": hashlib.sha256(raw).hexdigest(),
-                    }
-                    if index < len(entries):
-                        if entries[index] == entry:
-                            continue
-                        entries[index] = entry
-                    else:
-                        entries.append(entry)
-                    # Commit the checkpoint before the next shard: a kill
-                    # lands on the old or the new manifest, and a later
-                    # call resumes from exactly here.
-                    sd.save_manifest(directory, manifest)
-        return {"shards": total}
+            # Plan production as window-aligned runs. Missing vouched
+            # shards keep exactly their manifest intervals (which may
+            # straddle an old extension edge), grouped only while they
+            # line up with one window grid; the new increment is one run
+            # tiled from the last committed shard's end.
+            runs: list[tuple[int, int, int, int]] = []
+            ordered = sorted(missing)
+            cursor_index = 0
+            while cursor_index < len(ordered):
+                first = ordered[cursor_index]
+                lo = entries[first]["start"]
+                count = 0
+                hi = lo
+                while cursor_index + count < len(ordered):
+                    slot = ordered[cursor_index + count]
+                    expected_lo = lo + count * window
+                    if entries[slot]["start"] != expected_lo:
+                        break
+                    hi = entries[slot]["end"]
+                    count += 1
+                    if hi != lo + count * window:
+                        # A short shard ends this grid; anything past it
+                        # starts its own run on the next edge.
+                        break
+                runs.append((first, count, lo, hi))
+                cursor_index += count
+
+            extend_from = entries[-1]["end"] if entries else start
+            if extend_from < end:
+                count = sd.shard_count(extend_from, end, window)
+                runs.append((len(entries), count, extend_from, end))
+
+            if not runs:
+                # The committed manifest already vouches for every shard.
+                return {"shards": len(entries)}
+
+            manifest = {
+                "version": sd.MANIFEST_VERSION,
+                "tenant": tenant,
+                "start": start,
+                "end": end,
+                "window": window,
+                "shards": entries,
+            }
+            for first, count, lo, hi in runs:
+                # Each run is one snapshot stream, so log reads track the
+                # increment and memory tracks a single window.
+                with self.export_shards(tenant, lo, hi, window) as stream:
+                    for offset, shard in enumerate(stream):
+                        index = first + offset
+                        raw = sd.shard_bytes(shard)
+                        name = sd.shard_name(index)
+                        sd.write_shard(directory, name, raw)
+                        entry = {
+                            "name": name,
+                            "start": shard["start"],
+                            "end": shard["end"],
+                            "size": len(raw),
+                            "sha256": hashlib.sha256(raw).hexdigest(),
+                        }
+                        if index < len(entries):
+                            entries[index] = entry
+                        else:
+                            entries.append(entry)
+                        # Commit the checkpoint before the next shard: a
+                        # kill lands on the old or the new manifest, and
+                        # a later call resumes from exactly here.
+                        sd.save_manifest(directory, manifest)
+            return {"shards": len(entries)}
 
 
     # ------------------------------------------------------------------
@@ -2577,18 +2643,6 @@ def _iter_complete_lines(path: str) -> Iterator[bytes]:
             if not line.endswith(b"\n"):
                 return
             yield line
-
-
-def _index_runs(indices: list[int]) -> Iterator[tuple[int, int]]:
-    """Group a sorted index list into contiguous ``[start, end)`` runs."""
-    run_start = previous = indices[0]
-    for index in indices[1:]:
-        if index == previous + 1:
-            previous = index
-            continue
-        yield run_start, previous + 1
-        run_start = previous = index
-    yield run_start, previous + 1
 
 
 def _write_all(fd: int, data: bytes) -> None:

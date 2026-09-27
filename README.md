@@ -113,17 +113,36 @@ the same windowed export as a shard directory: one file per shard
 (`shard-00000000.json`, ...), each byte-identical to the corresponding
 in-memory shard, plus a self-authenticating `manifest.json` — one compact
 JSON line with a trailing newline, recording in shard order every shard's
-file name, index interval and byte sha256. It returns `{"shards": n}` with
-`n` the number of completely persisted shards. Every file is committed
-with a temp-file write + fsync + atomic rename and the manifest is
-re-committed as each shard lands, so a process killed in any commit
-window leaves the directory at the old or the new committed state. Calling
-it again on the same directory resumes the export: shards the manifest
-already vouches for are authenticated in place and never rewritten, only
-the missing ones are produced. A target that is not a directory, an
-unparseable or tampered manifest, a manifest describing a different
-export, or an existing shard that does not match the manifest raises
-`ValueError`; argument type errors raise `TypeError`.
+file name, index interval, byte size and byte sha256. It returns
+`{"shards": n}` with `n` the total number of shards the committed
+directory holds. Every file is committed with a temp-file write + fsync +
+atomic rename and the manifest is re-committed as each shard lands, so a
+process killed in any commit window leaves the directory at the old or
+the new committed state. Calling it again on the same directory resumes
+the export: shards the manifest already vouches for are checked at
+manifest level only (presence and recorded size), never rewritten or
+re-hashed, and only the missing ones are produced.
+
+The directory also extends incrementally. When the log keeps growing
+after the first landing, calling it again with the new complete prefix
+as `end` (same tenant, `start` and `window`) keeps every committed
+shard exactly where it is — including a short shard at the old prefix
+edge — and tiles the new records straight on from the last committed
+shard's end to the new `end`: the shards stay numbered from zero with
+no gap, no overlap and no renumbering, and the result is item-wise
+identical to a one-shot export of the same `[start, end)` interval.
+Reads and digest work on a resume or extension track the missing
+increment alone. Every caller of one directory — resume or extension,
+across processes — serializes on a per-directory lock file
+(`.shards.lock` inside the directory), so concurrent runs commit one
+after another; a process killed mid-run leaves either the previous
+committed state or a fully committed new one, and the next holder reaps
+staging temp files and shards a killed commit left unreferenced before
+continuing. A target that is not a directory, an unparseable or
+tampered manifest, a manifest describing a different export (including
+an `end` smaller than the committed prefix), or an existing shard
+whose recorded size no longer matches raises `ValueError`; argument
+type errors raise `TypeError`.
 
 `audit_chain.open_shard(directory, index)` reads one shard back out of a
 shard directory for offline verification: it authenticates the shard
@@ -220,8 +239,12 @@ back to a full ordered byte scan with identical conclusions. Sharded export
 (`export_shards`) inherits the same cost model shard by shard: production
 memory tracks a single window, and digest work and read volume track the
 interval, never the history length. Persisting the shards
-(`export_shards_dir`) keeps that model: a resumed export reads only the
-missing increment, and `open_shard` reads only the shard it returns.
+(`export_shards_dir`) keeps that model: a resumed export checks the
+vouched shards at manifest level only, reads and hashes just the
+missing increment, and a later call that extends the directory after
+the log grew reads only the newly tiled shards' records; `open_shard`
+reads only the shard it returns. All such calls on one directory
+serialize on one per-directory lock.
 
 ### Crash recovery
 
