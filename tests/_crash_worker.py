@@ -34,6 +34,15 @@ def main() -> None:
         chain.archive(sys.argv[4] if len(sys.argv) > 4 else path + ".archive")
     elif operation == "recover":
         chain.recover()
+    elif operation == "shards":
+        # argv[4..7] carry start, end, window and the shard directory.
+        chain.export_shards_dir(
+            "t",
+            int(sys.argv[4]),
+            int(sys.argv[5]),
+            int(sys.argv[6]),
+            sys.argv[7],
+        )
     else:  # pragma: no cover - test harness error
         raise SystemExit(f"unknown operation {operation}")
 

@@ -108,6 +108,60 @@ the remaining shards. An empty shard stream or a non-dict element raises
 incremental form: `.check(shard)` returns each shard's verdict as it is fed,
 `.finish()` returns the whole-interval verdict.
 
+### Durable shard directories
+
+`Chain.export_shards_dir(tenant, start, end, window, dir_path)` (also the
+module-level `audit_chain.export_shards_dir(chain, tenant, start, end,
+window, dir_path)`) cuts the interval into the exact same window-sized
+shards as `export_shards` and lands them in a shard directory:
+
+- one file per shard (`shard-00000000.json`, ...) whose bytes are the
+  canonical compact JSON of the shard proof — verbatim the bytes the
+  in-memory exporter serializes for that shard, with no added newline;
+- one self-authenticating manifest `shards-manifest.json`: a single
+  compact JSON line followed by one trailing newline, recording per shard
+  index the shard file's name, interval, byte size and byte digest
+  (sha256), signed with a tag over the canonical manifest body.
+
+It returns `{"shards": n}`, the number of fully landed shards. Every commit
+is a temp-file write, fsync and atomic rename — shard bytes are published
+before the manifest revision that advertises their digest — so a process
+hard-killed in any commit window leaves either the previous or the next
+consistent manifest revision, never a half-renamed shard; stale temp files
+are reaped on the next call. Calling it again on the same directory resumes
+the export: the parameters must match the recorded ones, complete shards are
+never rewritten, and only the missing shards (grouped into contiguous runs,
+each one ordinary lazy export) are produced, so read volume, digest work and
+memory track a single window plus the missing increment, never the history
+length. The target not being a directory, an unparseable or unauthenticated
+manifest, a parameter mismatch, a shard file the manifest does not name, or
+an advertised shard whose size changed, raises `ValueError`; an argument of
+the wrong Python type raises `TypeError`; a non-positive or non-integer
+`window`, an empty or reversed interval, and non-integer or out-of-bounds
+endpoints raise `ValueError`.
+
+`audit_chain.open_shard(dir_path, index) -> dict` fetches one shard by
+index for an offline check: it reads only that shard file and the manifest
+— no other shard and no log file are opened — and returns the shard proof,
+which `verify_proof` verifies anywhere. A missing directory, manifest or
+shard file (including a shard the manifest does not yet vouch for after an
+interrupted export) raises `FileNotFoundError`; a non-integer or
+out-of-range index raises `ValueError` (`TypeError` for a non-numeric
+index), and an unparseable manifest/shard or bytes that do not match the
+manifest digest raise `ValueError`.
+
+Loading every shard with `open_shard` and splicing it with
+`combine_proofs` reconstructs the whole interval, whose offline verdict is
+item-wise identical to one complete `export_range` over the same interval;
+per-shard offline (`verify_proof`), batch (`verify_proofs`) and
+command-line (`verify-proof`) conclusions are the same three `ok` /
+`first_bad` / `count` values. A byte-tampered shard fails its own digest
+check without affecting the other shards; a content-tampered shard yields
+the real global first-bad index. Shards are self-contained and per-tenant,
+so damage to other tenants or outside the interval cannot change a shard's
+conclusion. POSIX and Windows both support the layout; no network service
+or remote anchoring is involved.
+
 ### Online archiving
 
 `archive(archive_dir)` moves every sealed segment out of the hot store
@@ -192,7 +246,11 @@ interval's own lines. A never-verified or altered store transparently falls
 back to a full ordered byte scan with identical conclusions. Sharded export
 (`export_shards`) inherits the same cost model shard by shard: production
 memory tracks a single window, and digest work and read volume track the
-interval, never the history length.
+interval, never the history length. The durable shard-directory form
+(`export_shards_dir`/`open_shard`) keeps that model and adds resumption: a
+fully complete re-export reads only the small manifest, and a partial
+resume reads just the units covering the missing contiguous run; cold-start
+counting streams the log line by line rather than holding a unit whole.
 
 ### Crash recovery
 

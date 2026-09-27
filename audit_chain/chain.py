@@ -72,6 +72,10 @@ _FILE_UNIT = "$"
 _O_BINARY = getattr(os, "O_BINARY", 0)
 _DEFAULT_LOCK_TIMEOUT = 10.0
 _DEFAULT_MAX_SEGMENTS = 2
+# Streaming byte reads: no unit is ever held whole in memory, so cold-start
+# scans and shard production track the current shard window, not the unit
+# (or history) length.
+_READ_CHUNK = 1 << 20
 # Present in the store directory while an archive migration is in flight;
 # left behind only by a killed migration and cleared by the next healer.
 _ARCHIVE_MARKER = ".archiving"
@@ -1565,6 +1569,26 @@ class Chain:
             locked.__exit__(None, None, None)
             raise
 
+    def export_shards_dir(
+        self, tenant: str, start: int, end: int, window: int, dir_path: str
+    ) -> dict:
+        """Persist the windowed shards of ``[start, end)`` into a directory.
+
+        Thin, lock-free wrapper around
+        :func:`audit_chain.shards.export_shards_dir`: each shard becomes
+        one file whose bytes are the canonical JSON of exactly the shard
+        proof :meth:`export_shards` produces, and a self-authenticating
+        manifest records each shard's name, interval and byte digest. A
+        second call on the same directory resumes the export and only
+        fills missing shards; complete shards are never rewritten.
+        Returns ``{"shards": n}`` -- the number of complete shards on
+        disk. See :mod:`audit_chain.shards` for the exact error
+        semantics and the crash-window guarantees.
+        """
+        from .shards import export_shards_dir as _export
+
+        return _export(self, tenant, start, end, window, dir_path)
+
     def _produce_shards(
         self,
         units: list[dict],
@@ -1589,26 +1613,28 @@ class Chain:
         cache can guide the read. Records are counted exactly the way
         the range collector counts them -- complete newline-terminated
         lines only, malformed lines and a crashed half-written tail
-        skipped -- with no digest work and no retained records.
+        skipped -- with no digest work, no retained records and no whole
+        unit in memory: each unit is read line by line, so the scan's
+        memory is one line and is independent of the history length.
         """
         counts: list[int] = []
         total = 0
         for unit in units:
             try:
-                with open(unit["path"], "rb") as handle:
-                    raw = handle.read()
+                handle = open(unit["path"], "rb")
             except FileNotFoundError:
                 if not unit["sealed"]:
                     counts.append(total)
                     continue
                 raise
-            for line_raw in raw.split(b"\n")[:-1]:
-                try:
-                    record = st.decode_records(line_raw + b"\n")[0]
-                except ValueError:
-                    continue
-                if record["tenant"] == tenant:
-                    total += 1
+            with handle:
+                for line in _iter_lines(handle):
+                    try:
+                        record = st.decode_records(line)[0]
+                    except ValueError:
+                        continue
+                    if record["tenant"] == tenant:
+                        total += 1
             counts.append(total)
         return counts
 
@@ -1840,9 +1866,10 @@ class Chain:
         """Yield shard materials for ``[start, end)`` in window-sized pieces.
 
         One ordered pass over the covering units: each unit is opened at
-        most once and only the current shard's records are retained, so
-        memory tracks a single window, never the interval or the
-        history. Anchoring is exactly the bounded exporter's -- manifest
+        most once and read line by line -- no unit is ever held whole in
+        memory -- and only the current shard's records are retained, so
+        memory tracks a single window, never the interval, the unit or
+        the history. Anchoring is exactly the bounded exporter's -- manifest
         windows for preserved sealed bytes, narrowed runs of consecutive
         interval lines in a growing tail -- so a shard boundary landing
         inside a preserved window carries the same anchor on both sides
@@ -1864,9 +1891,6 @@ class Chain:
 
         for ui in range(first_unit, last_unit + 1):
             unit = units[ui]
-            with open(unit["path"], "rb") as handle:
-                raw = handle.read()
-
             parts = unit["parts"]
             window_ends: list[int] = []
             running = 0
@@ -1877,7 +1901,8 @@ class Chain:
             # Pending narrowed tail window: [blob, slots]. It holds one
             # run of physically consecutive interval lines, so its bytes
             # contain only interval records -- no other-tenant or
-            # out-of-range line.
+            # out-of-range line. The blob is at most one shard window's
+            # worth of lines, so it never grows with the history.
             run: Optional[list] = None
             prev_tail_end: Optional[int] = None
             base = counts[ui - 1] if ui else 0
@@ -1900,97 +1925,100 @@ class Chain:
                 )
                 run = None
 
-            for line_raw in raw.split(b"\n")[:-1]:
-                line_start = pos
-                line = line_raw + b"\n"
-                pos += len(line)
-                try:
-                    record = st.decode_records(line)[0]
-                except ValueError:
-                    record = None
-                is_tenant = record is not None and record["tenant"] == tenant
-                included = is_tenant and shard_start <= local < shard_end
+            with open(unit["path"], "rb") as handle:
+                # One streaming pass: each complete newline-terminated
+                # line is visited once and released immediately, so the
+                # only retained bytes are the current tail-run blob.
+                for line in _iter_lines(handle):
+                    line_start = pos
+                    pos += len(line)
+                    try:
+                        record = st.decode_records(line)[0]
+                    except ValueError:
+                        record = None
+                    is_tenant = record is not None and record["tenant"] == tenant
+                    included = is_tenant and shard_start <= local < shard_end
 
-                if is_tenant and local == shard_start:
-                    predecessor = record["prev"]
+                    if is_tenant and local == shard_start:
+                        predecessor = record["prev"]
 
-                if included:
-                    win_index = 0
-                    while (
-                        win_index < len(window_ends)
-                        and line_start >= window_ends[win_index]
-                    ):
-                        win_index += 1
-                    if win_index < len(window_ends):
-                        # Preserved sealed window: reuse the manifest anchor.
-                        flush_tail()
-                        prev_tail_end = line_start + len(line)
-                        window_start = window_ends[win_index - 1] if win_index else 0
-                        key = (ui, win_index)
-                        slot_pos = sealed_index.get(key)
-                        if slot_pos is None:
-                            part = parts[win_index]
-                            slot_pos = len(emitted)
-                            sealed_index[key] = slot_pos
-                            emitted.append(
-                                {
-                                    "name": part["name"],
-                                    "size": part["size"],
-                                    "sha256": part["sha256"],
-                                    "records": [],
-                                }
-                            )
-                        emitted[slot_pos]["records"].append(
-                            (local, line_start - window_start, record)
-                        )
-                    else:
-                        # Growing tail: consecutive interval lines share one
-                        # small window; any intervening physical line (another
-                        # tenant, an out-of-range record, a bad line) splits it.
-                        if run is None or line_start != prev_tail_end:
+                    if included:
+                        win_index = 0
+                        while (
+                            win_index < len(window_ends)
+                            and line_start >= window_ends[win_index]
+                        ):
+                            win_index += 1
+                        if win_index < len(window_ends):
+                            # Preserved sealed window: reuse the manifest anchor.
                             flush_tail()
-                            run = [b"", []]
-                        offset_in_run = len(run[0])
-                        run[0] += line
-                        run[1].append((local, offset_in_run, record))
-                        prev_tail_end = line_start + len(line)
-                else:
-                    flush_tail()
-                    prev_tail_end = None
-
-                if is_tenant:
-                    local += 1
-                    if local == shard_end:
-                        # The shard is complete: seal it before any later
-                        # record (or unit) is touched, so only one
-                        # window's material is ever retained.
+                            prev_tail_end = line_start + len(line)
+                            window_start = window_ends[win_index - 1] if win_index else 0
+                            key = (ui, win_index)
+                            slot_pos = sealed_index.get(key)
+                            if slot_pos is None:
+                                part = parts[win_index]
+                                slot_pos = len(emitted)
+                                sealed_index[key] = slot_pos
+                                emitted.append(
+                                    {
+                                        "name": part["name"],
+                                        "size": part["size"],
+                                        "sha256": part["sha256"],
+                                        "records": [],
+                                    }
+                                )
+                            emitted[slot_pos]["records"].append(
+                                (local, line_start - window_start, record)
+                            )
+                        else:
+                            # Growing tail: consecutive interval lines share one
+                            # small window; any intervening physical line (another
+                            # tenant, an out-of-range record, a bad line) splits it.
+                            if run is None or line_start != prev_tail_end:
+                                flush_tail()
+                                run = [b"", []]
+                            offset_in_run = len(run[0])
+                            run[0] += line
+                            run[1].append((local, offset_in_run, record))
+                            prev_tail_end = line_start + len(line)
+                    else:
                         flush_tail()
-                        anchors = {
-                            seq: {
-                                "name": item["name"],
-                                "size": item["size"],
-                                "sha256": item["sha256"],
-                            }
-                            for seq, item in enumerate(emitted)
-                        }
-                        material = {
-                            "tenant": tenant,
-                            "start": shard_start,
-                            "end": shard_end,
-                            "count": total,
-                            "prev": predecessor if predecessor is not None else "",
-                            "anchors": anchors,
-                            "buckets": [
-                                {"seq": seq, "records": item["records"]}
+                        prev_tail_end = None
+
+                    if is_tenant:
+                        local += 1
+                        if local == shard_end:
+                            # The shard is complete: seal it before any later
+                            # record (or unit) is touched, so only one
+                            # window's material is ever retained.
+                            flush_tail()
+                            anchors = {
+                                seq: {
+                                    "name": item["name"],
+                                    "size": item["size"],
+                                    "sha256": item["sha256"],
+                                }
                                 for seq, item in enumerate(emitted)
-                            ],
-                        }
-                        shard_start = shard_end
-                        shard_end = min(shard_end + window, end)
-                        emitted = []
-                        sealed_index = {}
-                        predecessor = None
-                        yield material
+                            }
+                            material = {
+                                "tenant": tenant,
+                                "start": shard_start,
+                                "end": shard_end,
+                                "count": total,
+                                "prev": predecessor if predecessor is not None else "",
+                                "anchors": anchors,
+                                "buckets": [
+                                    {"seq": seq, "records": item["records"]}
+                                    for seq, item in enumerate(emitted)
+                                ],
+                            }
+                            shard_start = shard_end
+                            shard_end = min(shard_end + window, end)
+                            emitted = []
+                            sealed_index = {}
+                            predecessor = None
+                            yield material
 
             flush_tail()
 
@@ -2407,3 +2435,26 @@ def _write_all(fd: int, data: bytes) -> None:
     while view:
         written = os.write(fd, view)
         view = view[written:]
+
+
+def _iter_lines(handle: Any) -> Iterator[bytes]:
+    """Yield complete newline-terminated lines from a binary handle.
+
+    Bytes are pulled in fixed-size chunks and split incrementally, so a
+    whole unit (and therefore the history length) is never resident.
+    Exactly the records ``raw.split(b"\\n")[:-1]`` would visit are
+    produced, each with its terminator: a trailing partial line left by
+    a killed append is silently dropped, never reported as a record.
+    """
+    pending = b""
+    while True:
+        chunk = handle.read(_READ_CHUNK)
+        if not chunk:
+            break
+        pending += chunk
+        pieces = pending.split(b"\n")
+        pending = pieces[-1]
+        for piece in pieces[:-1]:
+            yield piece + b"\n"
+    # ``pending`` holds whatever follows the final newline: either
+    # nothing or a crashed half line, both of which are not records.
